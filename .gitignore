@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Conda environments (huge — never commit)
+cbdmrf/
+cbdmrfpy/
+installing_py_environment/
+
+# Build outputs
+build/
+dist/
+*.so
+
+# OS cruft
+.DS_Store
+**/.DS_Store
+
+# Local example/data folders — kept on disk, not uploaded
+INPUT_FILES/
+OUTPUT_FILES/
+deep_reco_example/
+demo_esmrmb2025/
+dot_prod_example/
+human_example/
+metrics_example/
+sequential_nn_example/
+supplementary/
+unsupervised_example/
+utils/
+wasabi_bruker_9p4T/
+pulseq-cest-library/
+
+.comments_backup/

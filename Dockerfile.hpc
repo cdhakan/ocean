@@ -1,0 +1,73 @@
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+LABEL maintainer="OCEAN MRF Project"
+LABEL description="Headless HPC compute image for OCEAN (no GUI)"
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ gfortran libstdc++6 \
+        swig \
+        git \
+        wget \
+        libhdf5-dev \
+        libopenblas-dev \
+        ffmpeg libsm6 libxext6 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV CONDA_DIR=/opt/conda
+RUN wget -qO /tmp/miniconda.sh \
+      "https://repo.anaconda.com/miniconda/Miniconda3-py39_23.11.0-1-Linux-x86_64.sh" \
+    && bash /tmp/miniconda.sh -b -p $CONDA_DIR \
+    && rm /tmp/miniconda.sh
+ENV PATH=$CONDA_DIR/bin:$PATH
+
+RUN conda install -y -c conda-forge \
+        python=3.9 \
+        numpy=1.23.5 \
+        scipy=1.10.0 \
+        matplotlib=3.9.0 \
+        h5py=3.10.0 \
+        hdf5 \
+    && conda clean -afy
+
+RUN pip install --no-cache-dir \
+        pymatreader>=0.0.30 \
+        nibabel>=4.0.0 \
+        pydicom>=2.3.0 \
+        PyYAML==6.0 \
+        tqdm \
+        numba==0.60.0 \
+        llvmlite==0.43.0 \
+        BMCTool==0.5.0 \
+        sigpy==0.1.22 \
+        ipykernel==6.29.0
+
+RUN pip install --no-cache-dir \
+        torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+        --index-url https://download.pytorch.org/whl/cu118
+
+WORKDIR /opt/ocean
+COPY open-py-cest-mrf /opt/ocean/open-py-cest-mrf
+
+RUN cd /opt/ocean/open-py-cest-mrf/cest_mrf/sim_lib \
+    && python setup.py build_ext --inplace \
+    && python setup.py install
+
+RUN pip install --no-cache-dir -e /opt/ocean/open-py-cest-mrf
+
+COPY MRFmatch_mt.py         /opt/ocean/
+COPY MRFmatch_B-SL_dk.py    /opt/ocean/
+COPY colormaps_dk.py         /opt/ocean/
+COPY utils/                  /opt/ocean/utils/
+
+RUN mkdir -p /data/input /data/output
+
+WORKDIR /opt/ocean
+
+CMD ["python", "-c", \
+     "import torch, numpy, scipy; \
+      print('OCEAN HPC container ready'); \
+      print(f'  Python  {__import__(\"sys\").version.split()[0]}'); \
+      print(f'  PyTorch {torch.__version__}'); \
+      print(f'  CUDA    {torch.version.cuda}'); \
+      print(f'  GPU(s): {torch.cuda.device_count()}')"]
