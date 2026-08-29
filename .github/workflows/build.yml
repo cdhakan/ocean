@@ -1,0 +1,245 @@
+name: Build OCEAN
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  PYTHON_VERSION: "3.9"
+  PULSEQ_LIB_REPO: "https://github.com/kherz/pulseq-cest-library"
+
+jobs:
+
+  build-windows:
+    name: "Build · Windows .exe"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install SWIG
+        run: choco install swig --no-progress -y
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pyinstaller-hooks-contrib pillow
+          pip install itk-elastix
+          pip install -e open-py-cest-mrf/
+
+      - name: Compile BMCSimulator + pypulseq (C++ core, vendored)
+        working-directory: open-py-cest-mrf/cest_mrf/sim_lib
+        shell: bash
+        run: |
+          pip install --upgrade pip setuptools wheel
+          rm -rf build dist *.egg-info
+          rm -f BMCSimulator.py BMCSimulator_wrap.cpp *.so *.pyd
+          python setup.py build_ext --inplace
+          pip install . --no-deps --no-build-isolation
+          python "$GITHUB_WORKSPACE/.github/fix_bmc_encoding.py" ./BMCSimulator.py
+          cd "$GITHUB_WORKSPACE/open-py-cest-mrf/cest_mrf/pypulseq"
+          pip install . --no-deps --no-build-isolation
+
+      - name: Fetch pulseq-CEST library
+        run: git clone --depth 1 ${{ env.PULSEQ_LIB_REPO }} pulseq-cest-library
+
+      - name: Generate Windows icon (.ico)
+        shell: python
+        run: |
+          from PIL import Image
+          from pathlib import Path
+          src = Path("icon.png"); dst = Path("assets/AppIcon.ico")
+          if src.exists():
+              Image.open(src).convert("RGBA").save(
+                  dst, format="ICO",
+                  sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
+              print("Saved", dst)
+          else:
+              print("icon.png not found — building without custom icon")
+
+      - name: Build with PyInstaller
+        env:
+          OCEAN_PULSEQ_LIBRARY: ${{ github.workspace }}\pulseq-cest-library\seq-library
+        run: pyinstaller OCEAN.spec --clean --noconfirm --log-level WARN
+
+      - name: Zip dist/OCEAN → OCEAN.zip
+        shell: pwsh
+        run: Compress-Archive -Path dist\OCEAN -DestinationPath dist\OCEAN.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OCEAN-Windows
+          path: dist/OCEAN.zip
+          retention-days: 30
+
+  build-macos:
+    name: "Build · macOS .dmg"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install SWIG + create-dmg
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
+        run: brew install swig create-dmg
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller pyinstaller-hooks-contrib
+          pip install itk-elastix
+          pip install -e open-py-cest-mrf/
+
+      - name: Compile BMCSimulator + pypulseq (C++ core, vendored)
+        working-directory: open-py-cest-mrf/cest_mrf/sim_lib
+        shell: bash
+        run: |
+          pip install --upgrade pip setuptools wheel
+          rm -rf build dist *.egg-info
+          rm -f BMCSimulator.py BMCSimulator_wrap.cpp *.so *.pyd
+          python setup.py build_ext --inplace
+          pip install . --no-deps --no-build-isolation
+          python "$GITHUB_WORKSPACE/.github/fix_bmc_encoding.py" ./BMCSimulator.py
+          cd "$GITHUB_WORKSPACE/open-py-cest-mrf/cest_mrf/pypulseq"
+          pip install . --no-deps --no-build-isolation
+
+      - name: Fetch pulseq-CEST library
+        run: git clone --depth 1 ${{ env.PULSEQ_LIB_REPO }} pulseq-cest-library
+
+      - name: Generate macOS icon (.icns)
+        run: |
+          if [ -f "icon.png" ] && [ ! -f "assets/AppIcon.icns" ]; then
+            mkdir -p assets/AppIcon.iconset
+            for s in 16 32 64 128 256 512; do
+              sips -z $s $s icon.png --out "assets/AppIcon.iconset/icon_${s}x${s}.png" >/dev/null
+              sips -z $((s*2)) $((s*2)) icon.png --out "assets/AppIcon.iconset/icon_${s}x${s}@2x.png" >/dev/null
+            done
+            iconutil -c icns assets/AppIcon.iconset -o assets/AppIcon.icns
+          fi
+
+      - name: Build with PyInstaller
+        env:
+          OCEAN_PULSEQ_LIBRARY: ${{ github.workspace }}/pulseq-cest-library/seq-library
+        run: pyinstaller OCEAN.spec --clean --noconfirm --log-level WARN
+
+      - name: Determine version string
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create DMG
+        run: |
+          DMG="dist/OCEAN.dmg"
+          create-dmg --volname "OCEAN" --window-pos 200 120 \
+            --window-size 660 420 --icon-size 100 --icon "OCEAN.app" 180 200 \
+            --hide-extension "OCEAN.app" --app-drop-link 460 200 \
+            "${DMG}" "dist/OCEAN.app" \
+          || hdiutil create -volname "OCEAN" -srcfolder "dist/OCEAN.app" \
+               -ov -format UDZO "${DMG}"
+          echo "DMG_PATH=${DMG}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OCEAN-macOS
+          path: ${{ env.DMG_PATH }}
+          retention-days: 30
+
+  build-linux:
+    name: "Build · Linux tar.gz"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install SWIG + Qt runtime libs
+        run: sudo apt-get update && sudo apt-get install -y swig libegl1 libgl1
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller pyinstaller-hooks-contrib
+          pip install itk-elastix
+          pip install -e open-py-cest-mrf/
+
+      - name: Compile BMCSimulator + pypulseq (C++ core, vendored)
+        working-directory: open-py-cest-mrf/cest_mrf/sim_lib
+        shell: bash
+        run: |
+          pip install --upgrade pip setuptools wheel
+          rm -rf build dist *.egg-info
+          rm -f BMCSimulator.py BMCSimulator_wrap.cpp *.so *.pyd
+          python setup.py build_ext --inplace
+          pip install . --no-deps --no-build-isolation
+          python "$GITHUB_WORKSPACE/.github/fix_bmc_encoding.py" ./BMCSimulator.py
+          cd "$GITHUB_WORKSPACE/open-py-cest-mrf/cest_mrf/pypulseq"
+          pip install . --no-deps --no-build-isolation
+
+      - name: Fetch pulseq-CEST library
+        run: git clone --depth 1 ${{ env.PULSEQ_LIB_REPO }} pulseq-cest-library
+
+      - name: Build with PyInstaller
+        env:
+          OCEAN_PULSEQ_LIBRARY: ${{ github.workspace }}/pulseq-cest-library/seq-library
+        run: pyinstaller OCEAN.spec --clean --noconfirm --log-level WARN
+
+      - name: Tar dist/OCEAN → OCEAN.tar.gz
+        run: tar -czf dist/OCEAN.tar.gz -C dist OCEAN
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OCEAN-Linux
+          path: dist/OCEAN.tar.gz
+          retention-days: 30
+
+  release:
+    name: "Publish GitHub Release"
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: OCEAN-Windows, path: release-files/ }
+      - uses: actions/download-artifact@v4
+        with: { name: OCEAN-macOS, path: release-files/ }
+      - uses: actions/download-artifact@v4
+        with: { name: OCEAN-Linux, path: release-files/ }
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "OCEAN ${{ github.ref_name }}"
+          body: |
+
+            | Platform | File |
+            |----------|------|
+            | Windows 10/11 | `OCEAN.zip` |
+            | macOS 11+ | `OCEAN.dmg` |
+            | Linux x86_64 | `OCEAN.tar.gz` |
+
+            > **Windows:** SmartScreen may warn ("Unknown publisher") on first run —
+            > click **More info → Run anyway** (normal for unsigned apps).
+            > **macOS:** right-click → **Open** the first time (unsigned app).
+          files: release-files/*
+          generate_release_notes: true
