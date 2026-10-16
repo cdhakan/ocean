@@ -12,6 +12,11 @@ installing_py_environment/
 build/
 dist/
 *.so
+# generated from icon.png by build_dmg.sh
+assets/AppIcon.iconset/
+
+# Claude Code session data
+.claude/
 
 # OS cruft
 .DS_Store

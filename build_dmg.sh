@@ -129,12 +129,9 @@ fi
 
 echo ""
 echo "═══════════════════════════════════════════════"
-echo "  ✓  DONE!  Output:"
+echo "  DONE!  Output:"
 echo "     ${DIST_DIR}/${DMG_NAME}"
 FILESIZE=$(du -sh "${DIST_DIR}/${DMG_NAME}" 2>/dev/null | cut -f1)
 echo "     Size: ${FILESIZE}"
 echo ""
-echo "  To distribute: send this single .dmg file."
-echo "  Recipients open it, drag the app"
-echo "  into their /Applications folder, done."
 echo "═══════════════════════════════════════════════"

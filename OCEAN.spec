@@ -1,13 +1,23 @@
 import sys
 import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_all
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_all, copy_metadata
 
 ROOT       = Path(SPECPATH)
 CEST_LIB   = ROOT / "open-py-cest-mrf"
 MAIN_ENTRY = ROOT / "my_gui" / "main.py"
 
 sys.path.insert(0, str(CEST_LIB))
+
+# Vendored Pulseq 1.3.1 (the version the sequence writers target).  It must be
+# on the ANALYSIS path: in the dev env it is an editable install resolved by a
+# custom import finder, which PyInstaller's module graph does not follow — the
+# package was then shipped as a code-less data folder ("missing module named
+# pypulseq").  Its __init__ reads Path(__file__).parent.parent / 'VERSION',
+# i.e. <bundle root>/VERSION once frozen, so that file is bundled at "." below.
+PYPULSEQ_SRC = CEST_LIB / "cest_mrf" / "pypulseq"
+if PYPULSEQ_SRC.is_dir():
+    sys.path.insert(0, str(PYPULSEQ_SRC))
 
 _pyqt6_hidden = [
     "PyQt6.QtCore",
@@ -65,6 +75,40 @@ _app_hidden = (
     collect_submodules("cest_mrf")
 )
 
+# pypulseq reads its version from a VERSION file one level ABOVE the package
+# (vendored 1.3.1: <bundle root>/VERSION when frozen) or via importlib.metadata
+# (newer releases).  Bundle both so the packaged app does not crash at
+# `import pypulseq` with FileNotFoundError: .../Contents/Frameworks/VERSION.
+_pypulseq_datas = []
+if (PYPULSEQ_SRC / "VERSION").is_file():
+    _pypulseq_datas.append((str(PYPULSEQ_SRC / "VERSION"), "."))
+try:
+    _pypulseq_datas += collect_data_files("pypulseq")   # VERSION + any data files
+except Exception:
+    pass
+try:
+    _pypulseq_datas += copy_metadata("pypulseq")         # for importlib.metadata
+except Exception:
+    pass
+try:
+    _app_hidden += collect_submodules("pypulseq")
+except Exception:
+    pass
+
+# Siemens TWIX (.dat) raw-data reader (my_gui/siemens_twix_reader.py) needs the
+# pure-python `twixtools` package.  Optional: bundled only when it is installed
+# in the build env; otherwise the GUI option shows a clear "pip install" message.
+import importlib.util as _ilu
+if _ilu.find_spec("twixtools") is not None:
+    try:
+        _app_hidden += collect_submodules("twixtools")
+        _pypulseq_datas += collect_data_files("twixtools")
+        print("[spec] bundling twixtools (Siemens TWIX reader enabled)")
+    except Exception as _tw_err:
+        print(f"[spec] twixtools found but not bundled: {_tw_err}")
+else:
+    print("[spec] twixtools NOT installed — Siemens TWIX reader disabled in this build")
+
 _bmc_hidden = ["BMCSimulator", "_BMCSimulator"]
 
 hidden_imports = (
@@ -81,6 +125,8 @@ datas = [
     *collect_data_files("matplotlib"),
 
     *collect_data_files("PyQt6"),
+
+    *_pypulseq_datas,
 ]
 
 if CEST_LIB.exists():
@@ -142,6 +188,44 @@ if not os.environ.get("OCEAN_NO_DCM2NIIX"):
     except Exception as _d2n_err:
         print(f"[spec] dcm2niix NOT bundled (DICOM-folder loading limited): {_d2n_err}")
 
+# ── BM3D / BM4D denoising (optional `bm3d` package) ──────────────────────────
+# bm4d ships ONE C library per platform (libbm4d_mac_arm.so, libbm4d_mac.so,
+# libbm4d_win.so — a Windows PE DLL despite the .so name — and libbm4d.so) and
+# ctypes-loads the matching one from its own package dir; PyInstaller's import
+# analysis never sees it, so the frozen app raised PyInstallerImportError at
+# `import bm3d` during start-up.  collect_all() must NOT be used here: it feeds
+# the foreign-platform files to the binary analysis, which aborts the build
+# ("Unknown Mach-O header: 0x4d5a9000").  Bundle only the build platform's
+# library (as a binary, so it is code-signed) plus the package data.  The GUI
+# guards the import, so an absent package only disables the BM3D option.
+import platform as _platform
+if _ilu.find_spec("bm4d") is not None:
+    try:
+        _bm4d_dir = Path(_ilu.find_spec("bm4d").origin).parent
+        if sys.platform == "darwin":
+            _bm4d_lib = ("libbm4d_mac_arm.so" if _platform.machine() == "arm64"
+                         else "libbm4d_mac.so")
+        elif sys.platform == "win32":
+            _bm4d_lib = "libbm4d_win.so"
+        else:
+            _bm4d_lib = "libbm4d.so"
+        _bm4d_libp = _bm4d_dir / _bm4d_lib
+        if not _bm4d_libp.is_file():
+            raise FileNotFoundError(_bm4d_libp)
+        binaries.append((str(_bm4d_libp), "bm4d"))
+        for _bm4d_dat in _bm4d_dir.glob("*.mat"):
+            datas.append((str(_bm4d_dat), "bm4d"))
+        # NOTE: do NOT call collect_submodules()/collect_all() on bm4d or bm3d.
+        # pkgutil treats the bare-".so" libraries as extension modules
+        # (bm4d.libbm4d_win, …), PyInstaller then parses the foreign-platform
+        # files as native binaries and the build aborts.  The Python modules
+        # are reached through the GUI's `import bm3d` anyway.
+        print(f"[spec] bundling bm4d ({_bm4d_lib}) for BM3D denoising")
+    except Exception as _bm4d_err:
+        print(f"[spec] bm4d NOT bundled (BM3D option disabled): {_bm4d_err}")
+else:
+    print("[spec] bm4d not installed — BM3D denoising disabled in this build")
+
 _hook_dir = ROOT / "_pyinstaller_hooks"
 _hook_dir.mkdir(exist_ok=True)
 _hook_file = _hook_dir / "rthook_cwd.py"
@@ -158,7 +242,8 @@ _hook_file.write_text(
 
 a = Analysis(
     [str(MAIN_ENTRY)],
-    pathex=[str(ROOT), str(CEST_LIB)],
+    pathex=[str(ROOT), str(CEST_LIB)]
+           + ([str(PYPULSEQ_SRC)] if PYPULSEQ_SRC.is_dir() else []),
     binaries=binaries,
     datas=datas,
     hiddenimports=hidden_imports,

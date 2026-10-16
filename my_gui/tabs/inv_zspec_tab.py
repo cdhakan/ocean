@@ -1393,12 +1393,24 @@ class InvZSpecTab(QWidget):
         self.btn_export.clicked.connect(self._export)
         ctrl.addWidget(self.btn_export)
 
+        self.chk_roi_only = QCheckBox("ROIs only")
+        self.chk_roi_only.setToolTip(
+            "Show the colored map inside the ROIs (and any outline drawn), over "
+            "the chosen Bkg image.")
+        self.chk_roi_only.toggled.connect(self._refresh_display)
+        ctrl.addWidget(self.chk_roi_only)
+
         self.chk_roi_bg = QCheckBox("ROIs + Bkg")
         self.chk_roi_bg.setToolTip(
             "Show the colored map only inside the ROIs, over the 1st raw image "
             "as a gray background.")
         self.chk_roi_bg.toggled.connect(self._refresh_display)
         ctrl.addWidget(self.chk_roi_bg)
+        # Mutually exclusive with ROIs only.
+        self.chk_roi_only.toggled.connect(
+            lambda on: on and self.chk_roi_bg.setChecked(False))
+        self.chk_roi_bg.toggled.connect(
+            lambda on: on and self.chk_roi_only.setChecked(False))
 
         self.btn_roi_bg = QPushButton("Bkg…")
         self.btn_roi_bg.setToolTip(
@@ -1504,6 +1516,13 @@ class InvZSpecTab(QWidget):
         self.btn_roi_table = QPushButton("ROI Statistics")
         self.btn_roi_table.clicked.connect(self._show_roi_table)
         btn_row2.addWidget(self.btn_roi_table)
+
+        self.btn_mtr_asym = QPushButton("MTR Asym (multi-B1)")
+        self.btn_mtr_asym.setToolTip(
+            "Plot MTR asymmetry (Z(−Δω) − Z(+Δω)) for every loaded B1 power, per ROI,\n"
+            "and fit each B1's Z-spectrum with Pseudo-Voigt / MPLF (amplitude vs B1).")
+        self.btn_mtr_asym.clicked.connect(self._show_multib1_mtrasym)
+        btn_row2.addWidget(self.btn_mtr_asym)
 
         # fs/ksw/R² parametric maps are generated automatically from the QUESP
         # ROI fits (see _show_roi_spectra → _run_quesp_maps(silent=True)); no
@@ -1865,13 +1884,13 @@ class InvZSpecTab(QWidget):
         # QUESP-pool chooser so the MTRasym / MTRRex / Ω-plot appear beneath the
         # 1/Z panels.  Both are silent no-ops when no ROIs are drawn yet.
         self._auto_precompute_1z()
-        # Auto-generate the per-voxel fs / ksw / R² parametric maps right after
-        # Run (background, silent; needs ≥3 B1 powers).  They appear in the
-        # Display selector when ready.
-        try:
-            self._run_quesp_maps(silent=True)
-        except Exception as _exc:
-            self._log(f"(fs/ksw map generation skipped: {_exc})")
+        # NOTE: the per-voxel fs / ksw / R² maps are NOT generated here any more
+        # (the full MT+CEST 1/Z fit per voxel is far too slow to run on every
+        # Run).  Save the 1/Z stack (.mat) — it carries every variable needed —
+        # and generate the maps on demand in the QUESP tab ("QUESP from 1/Z").
+        if len(self._datasets) >= 3:
+            self._log("fs / ksw maps: use “Save 1/Z → QUESP (.mat)” and generate "
+                      "them in the QUESP tab (per-voxel fit runs there on demand).")
 
     def _auto_precompute_1z(self):
         rois = [r for r in getattr(self, '_last_rois', [])
@@ -1912,6 +1931,32 @@ class InvZSpecTab(QWidget):
         self.lbl_run_status.setText("Cancelled.")
 
     # ── Per-voxel QUESP maps ──────────────────────────────────────────────────
+
+    def _quesp_map_mask(self, Yf: int, Xf: int):
+        """Mask for per-voxel QUESP maps at full resolution (Yf, Xf).
+
+        PREFER the whole-region outline (Phantom_outline / Brain_outline) so the
+        fs/ksw maps cover the ENTIRE phantom/brain — not just the small tube
+        ROIs.  Fall back to the union of drawn ROIs, then to None (the worker
+        then uses its intensity fallback / whole image)."""
+        rois = getattr(self, '_last_rois', [])
+        outline = next((r for r in rois
+                        if r.name in ('Phantom_outline', 'Brain_outline')
+                        and getattr(r, 'mask', None) is not None
+                        and np.asarray(r.mask).shape == (Yf, Xf)), None)
+        if outline is not None:
+            return np.asarray(outline.mask, dtype=bool)
+        named = [r for r in rois
+                 if r.name not in ('Phantom_outline', 'Brain_outline')
+                 and getattr(r, 'mask', None) is not None]
+        if not named:
+            return None
+        roi_mask = np.zeros((Yf, Xf), dtype=bool)
+        for r in named:
+            m = np.asarray(r.mask, dtype=bool)
+            if m.shape == (Yf, Xf):
+                roi_mask |= m
+        return roi_mask
 
     def _run_quesp_maps(self, silent: bool = False):
         """Launch per-voxel QUESP fitting → fs / ksw / R² / conc parametric maps.
@@ -1954,28 +1999,9 @@ class InvZSpecTab(QWidget):
         z0sl = z0[:, :, sl0, :] if z0.ndim == 4 else z0
         Yf, Xf = z0sl.shape[:2]
 
-        # Build mask.  PREFER the whole-region outline (Phantom_outline /
-        # Brain_outline) so the fs/ksw maps cover the ENTIRE phantom/brain — not
-        # just the small tube ROIs.  Fall back to the union of drawn ROIs, then
-        # to None (worker uses the intensity fallback / whole image).
-        rois = getattr(self, '_last_rois', [])
-        roi_mask = None
-        outline = next((r for r in rois
-                        if r.name in ('Phantom_outline', 'Brain_outline')
-                        and getattr(r, 'mask', None) is not None
-                        and np.asarray(r.mask).shape == (Yf, Xf)), None)
-        if outline is not None:
-            roi_mask = np.asarray(outline.mask, dtype=bool)
-        else:
-            named = [r for r in rois
-                     if r.name not in ('Phantom_outline', 'Brain_outline')
-                     and getattr(r, 'mask', None) is not None]
-            if named:
-                roi_mask = np.zeros((Yf, Xf), dtype=bool)
-                for r in named:
-                    m = np.asarray(r.mask, dtype=bool)
-                    if m.shape == (Yf, Xf):
-                        roi_mask |= m
+        # Build mask (whole-region outline → ROI union → None); shared with the
+        # 1/Z-stack export so the QUESP tab fits the same voxels.
+        roi_mask = self._quesp_map_mask(Yf, Xf)
 
         n_mask = int(roi_mask.sum()) if roi_mask is not None else (Yf * Xf)
         # Fit-grid cap: the per-voxel MT+CEST fit runs on a grid no larger than
@@ -2130,6 +2156,14 @@ class InvZSpecTab(QWidget):
                 return np.where(msk, arr, np.nan)
             return arr
 
+        # Display mode: "ROIs + Bkg" restricts colour to the drawn measurement
+        # ROIs; "ROIs only" also includes any outline (brain/phantom) drawn.
+        # Both paint the colour over the chosen Bkg image.
+        _roi_only = (getattr(self, "chk_roi_only", None) is not None
+                     and self.chk_roi_only.isChecked())
+        _overlay_on = _roi_only or self.chk_roi_bg.isChecked()
+        _excl = () if _roi_only else ("Phantom_outline", "Brain_outline", "Mouse_Brain_outline")
+
         idx = max(0, self.combo_display.currentIndex())
 
         # ── QUESP per-voxel map selected ──────────────────────────────────────
@@ -2143,7 +2177,7 @@ class InvZSpecTab(QWidget):
                 _q_cmap = cmap if cmap != 'viridis' else entry.get('cmap', 'viridis')
                 _q_vmin = vmin if vmin is not None else entry.get('vmin', 0)
                 _q_vmax = vmax if vmax is not None else hi
-                if self.chk_roi_bg.isChecked():
+                if _overlay_on:
                     _base = None
                     if getattr(self, "_datasets", None):
                         _ds = self._datasets[0]
@@ -2153,7 +2187,7 @@ class InvZSpecTab(QWidget):
                             _base = _zi[:, :, _sl, 0] if _zi.ndim == 4 else _zi[:, :, 0]
                     if getattr(self, "_roi_bg_img", None) is not None:
                         _base = self._roi_bg_img
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), data.shape)
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), data.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = _q_cmap if str(_q_cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -2181,7 +2215,7 @@ class InvZSpecTab(QWidget):
                     lo, hi = None, None
                 _l_vmin = vmin if vmin is not None else lo
                 _l_vmax = vmax if vmax is not None else hi
-                if self.chk_roi_bg.isChecked():
+                if _overlay_on:
                     _base = None
                     if getattr(self, "_datasets", None):
                         _ds = self._datasets[0]
@@ -2191,7 +2225,7 @@ class InvZSpecTab(QWidget):
                             _base = _zi[:, :, _sl, 0] if _zi.ndim == 4 else _zi[:, :, 0]
                     if getattr(self, "_roi_bg_img", None) is not None:
                         _base = self._roi_bg_img
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), data.shape)
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), data.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -2221,7 +2255,7 @@ class InvZSpecTab(QWidget):
             _a_cmap  = cmap if cmap != 'viridis' else 'hot'
             _a_vmin  = vmin or 0
             _a_vmax  = vmax or lim
-            if self.chk_roi_bg.isChecked():
+            if _overlay_on:
                 _base = None
                 if getattr(self, "_datasets", None):
                     _ds = self._datasets[0]
@@ -2231,7 +2265,7 @@ class InvZSpecTab(QWidget):
                         _base = _zi[:, :, _sl, 0] if _zi.ndim == 4 else _zi[:, :, 0]
                 if getattr(self, "_roi_bg_img", None) is not None:
                     _base = self._roi_bg_img
-                _union = roi_union_mask(getattr(self, "_last_rois", []), data.shape)
+                _union = roi_union_mask(getattr(self, "_last_rois", []), data.shape, exclude=_excl)
                 if _base is not None and _union is not None:
                     _ovc = _a_cmap if str(_a_cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                     self.canvas.show_map_over_raw(
@@ -2259,44 +2293,92 @@ class InvZSpecTab(QWidget):
         roi_results = getattr(self, '_last_1z_roi_results', None)
         roi_spectra = getattr(self, '_last_1z_roi_spectra', None)
         p           = getattr(self, '_last_1z_params', None)
-        if not roi_results or not roi_spectra or p is None:
+        have_roi = bool(roi_results and roi_spectra and p is not None)
+        have_vox = len(self._datasets) >= 1
+        if not have_roi and not have_vox:
             QMessageBox.information(
-                par, "Run 1/Z fitting first",
-                "No 1/Z fit results to export yet.\n\n"
-                "Open “ROI Spectra (1/Z fit)”, run the per-ROI analysis, then\n"
-                "use this button to save the QUESP stack.")
+                par, "Nothing to export",
+                "Load the B1 datasets (and optionally run “ROI Spectra (1/Z "
+                "fit)”)\nbefore saving the 1/Z → QUESP stack.")
             return
-        # Pool list = union of fitted CEST pools across results (water excluded)
-        pools = []
-        for lst in roi_results.values():
-            for res in lst:
-                if res and 'cest_coeffs' in res:
-                    for pn in res['cest_coeffs']:
-                        if pn not in pools and pn != 'water':
-                            pools.append(pn)
-        rnames = list(roi_results.keys())
-        if not rnames or not pools:
-            QMessageBox.information(par, "Nothing to export",
-                                    "No fitted CEST pools available.")
-            return
-        n_b1 = max(len(roi_spectra[r]) for r in rnames)
-        R1   = float(p['R1'])
-        b1_arr = np.full(n_b1, np.nan)
-        out = {'R1': R1, 'B0_MHz': float(p['B0_MHz']),
-               'pools': np.array(pools, dtype=object),
-               'roi_names': np.array(rnames, dtype=object)}
-        for pool in pools:
-            # MTR_Rex(B1) = A_pool / R1  (A = R1·(1/Z−1) peak height)
-            M = np.full((len(rnames), n_b1), np.nan)
-            for ri, rname in enumerate(rnames):
-                for bi, (res, spec) in enumerate(zip(roi_results[rname],
-                                                     roi_spectra[rname])):
-                    b1_arr[bi] = spec[2]
-                    if res and pool in res.get('cest_coeffs', {}):
-                        A = float(res['cest_coeffs'][pool][0])
-                        M[ri, bi] = A / R1 if R1 > 0 else A
-            out[f"mtrrex__{pool}"] = M
-        out['satpwr_uT'] = b1_arr
+        if p is None:
+            p = self._get_params()
+        R1  = float(p['R1'])
+        out = {'R1': R1, 'B0_MHz': float(p['B0_MHz'])}
+        pools, rnames = [], []
+        b1_arr = np.array([], dtype=float)
+
+        if have_roi:
+            # ── Per-ROI MTR_Rex(B1)  →  fs / ksw TABLE in the QUESP tab ───────
+            # Pool list = union of fitted CEST pools across results (water excl.)
+            for lst in roi_results.values():
+                for res in lst:
+                    if res and 'cest_coeffs' in res:
+                        for pn in res['cest_coeffs']:
+                            if pn not in pools and pn != 'water':
+                                pools.append(pn)
+            rnames = list(roi_results.keys())
+            if rnames and pools:
+                n_b1 = max(len(roi_spectra[r]) for r in rnames)
+                b1_arr = np.full(n_b1, np.nan)
+                out['pools']     = np.array(pools, dtype=object)
+                out['roi_names'] = np.array(rnames, dtype=object)
+                for pool in pools:
+                    # MTR_Rex(B1) = A_pool / R1  (A = R1·(1/Z−1) peak height)
+                    M = np.full((len(rnames), n_b1), np.nan)
+                    for ri, rname in enumerate(rnames):
+                        for bi, (res, spec) in enumerate(zip(roi_results[rname],
+                                                             roi_spectra[rname])):
+                            b1_arr[bi] = spec[2]
+                            if res and pool in res.get('cest_coeffs', {}):
+                                A = float(res['cest_coeffs'][pool][0])
+                                M[ri, bi] = A / R1 if R1 > 0 else A
+                    out[f"mtrrex__{pool}"] = M
+            else:
+                pools, rnames = [], []
+
+        n_vox_b1 = 0
+        if have_vox:
+            # ── Per-VOXEL inputs  →  fs / ksw / R² MAPS in the QUESP tab ──────
+            # Everything InvZQUESPWorker needs (Z-stack per B1, ppm, B1, fit
+            # params, pools, mask) so the slow per-voxel 1/Z fit runs THERE on
+            # demand instead of automatically after every Run here.
+            pl  = self._get_params()
+            ds0 = self._datasets[0]
+            z0  = np.asarray(ds0['z_img']); sl0 = ds0.get('slice', 0)
+            Yf, Xf = (z0[:, :, sl0, :] if z0.ndim == 4 else z0).shape[:2]
+            b1_vox = []
+            for ds in self._datasets:
+                zv = np.asarray(ds['z_img']); sl = ds.get('slice', 0)
+                zsl = zv[:, :, sl, :] if zv.ndim == 4 else zv
+                if zsl.shape[:2] != (Yf, Xf):
+                    continue                      # worker would skip it too
+                i = len(b1_vox)
+                out[f"zimg__{i}"] = np.asarray(zsl, dtype=np.float32)
+                out[f"ppm__{i}"]  = np.asarray(ds['ppm'], dtype=float)
+                b1_vox.append(float(ds.get('b1_ut', pl['satpwr_uT'])))
+            n_vox_b1 = len(b1_vox)
+            out['invz_voxel_stack'] = 1
+            out['n_b1']             = n_vox_b1
+            out['b1_ut']            = np.asarray(b1_vox, dtype=float)
+            out['peak_type']        = str(pl['peak_type'])
+            out['ppm_exclude_MT']   = np.asarray(pl['ppm_exclude_MT'], float)
+            out['ppm_reinclude_MT'] = np.asarray(pl['ppm_reinclude_MT'], float)
+            out['ppm_include_CEST'] = np.asarray(pl['ppm_include_CEST'], float)
+            out['fit_mt']           = int(bool(pl.get('fit_mt', True)))
+            out['pools_all']        = np.array(self._get_active_pools(), dtype=object)
+            sel_q = [pn for pn in _expand_invz_pools(
+                         getattr(self, '_inv_selected_pools', None) or [])
+                     if pn not in ('water', 'MT') and pn in _L_DEFS]
+            out['qpools']      = np.array(sel_q, dtype=object)
+            mk = self._quesp_map_mask(Yf, Xf)
+            if mk is not None:
+                out['mask'] = mk.astype(np.uint8)
+            out['max_fit_dim'] = int(getattr(self, "_map_fit_dim", 96))
+            if b1_arr.size == 0:
+                out['satpwr_uT'] = out['b1_ut']   # keeps the QUESP loader's probe key
+        if b1_arr.size:
+            out['satpwr_uT'] = b1_arr
         path, _ = QFileDialog.getSaveFileName(
             par, "Save 1/Z → QUESP stack", "quesp_1z_stack.mat",
             "MATLAB (*.mat)")
@@ -2306,12 +2388,20 @@ class InvZSpecTab(QWidget):
             path += '.mat'
         try:
             savemat(path, out)
+            parts = []
+            if rnames and pools:
+                parts.append(f"• {len(rnames)} ROI(s) × {len(pools)} pool(s) × "
+                             f"{int(np.sum(np.isfinite(b1_arr)))} B1 power(s)"
+                             "  →  fs / ksw table")
+            if n_vox_b1:
+                parts.append(f"• per-voxel Z-stacks for {n_vox_b1} B1 power(s)"
+                             "  →  fs / ksw / R² maps (on demand)")
             QMessageBox.information(
                 par, "Saved",
                 f"QUESP stack saved:\n{os.path.basename(path)}\n\n"
-                f"{len(rnames)} ROI(s) × {len(pools)} pool(s) × "
-                f"{int(np.sum(np.isfinite(b1_arr)))} B1 power(s).\n"
-                "Load it in the QUESP tab to fit fs / ksw.")
+                + "\n".join(parts) +
+                "\n\nLoad it in the QUESP tab (“QUESP from 1/Z”) to fit the "
+                "table and/or generate the per-voxel maps.")
         except Exception as exc:
             QMessageBox.warning(par, "Save failed", str(exc))
 
@@ -3335,6 +3425,15 @@ class InvZSpecTab(QWidget):
         dlg.show()
 
     # ── ROI Stats table ───────────────────────────────────────────────────────
+
+    def _show_multib1_mtrasym(self):
+        """Multi-B1 MTR-asymmetry (one curve per B1 power, per ROI) + per-B1
+        Pseudo-Voigt / MPLF pool-fit amplitude-vs-B1 view."""
+        from my_gui.multib1_analysis import show_multib1_mtrasym
+        sl = (self.spin_slice.value() - 1) if hasattr(self, 'spin_slice') else 0
+        self._mtr_asym_dlg = show_multib1_mtrasym(
+            self, getattr(self, '_datasets', []), getattr(self, '_last_rois', []),
+            slice_idx=max(0, sl), title="Inverse-Z — Multi-B1 MTR Asymmetry")
 
     def _show_roi_table(self):
         from my_gui.roi_table_dialog import show_roi_table

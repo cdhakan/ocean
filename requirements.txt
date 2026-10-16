@@ -18,3 +18,6 @@ itk-elastix
 onnxruntime
 dcm2niix
 
+# Siemens TWIX (.dat) raw-data reader (pure Python; optional at runtime)
+twixtools
+

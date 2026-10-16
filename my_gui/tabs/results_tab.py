@@ -728,6 +728,12 @@ class ResultsTab(QWidget):
             "image as a gray anatomical background.")
         self.chk_roi_bg.toggled.connect(self._refresh_plot)
         disp_row.addWidget(self.chk_roi_bg)
+        # ROIs only / ROIs + Bkg are mutually exclusive (the Bkg… button force-
+        # checks ROIs + Bkg, which would otherwise leave both on).
+        self.chk_roi_only.toggled.connect(
+            lambda on: on and self.chk_roi_bg.setChecked(False))
+        self.chk_roi_bg.toggled.connect(
+            lambda on: on and self.chk_roi_only.setChecked(False))
         self.btn_roi_bg = QPushButton("Bkg…")
         self.btn_roi_bg.setToolTip(
             "Pick the grayscale background image (from the Scan Directory) "
@@ -1370,8 +1376,12 @@ class ResultsTab(QWidget):
         _roi_union = None
         if _roi_bg_on or _roi_only_on:
             union = None
+            # "ROIs only" colours every ROI + any outline drawn; "ROIs + Bkg"
+            # colours only the drawn measurement ROIs (outlines excluded).
+            _excl = () if _roi_only_on else (
+                "Phantom_outline", "Brain_outline", "Mouse_Brain_outline")
             for _roi in last_rois:
-                if getattr(_roi, 'name', '') == 'Phantom_outline':
+                if getattr(_roi, 'name', '') in _excl:
                     continue
                 try:
                     m = _roi.mask
@@ -1468,22 +1478,25 @@ class ResultsTab(QWidget):
         # ── "ROIs + Bg": gray 1st-raw-image underlay behind the ROI colours ──
         # The colour map (drawn next) is transparent outside the ROI union
         # (set_bad alpha=0 above), so this base shows through everywhere else.
-        if _roi_bg_on and _roi_union is not None and self._acquired_data is not None:
+        if (_roi_bg_on or _roi_only_on) and _roi_union is not None:
             try:
-                _sl = 0
-                _slider = getattr(self, '_acq_slice_slider', None)
-                if self._acquired_data.shape[1] > 1 and _slider is not None:
-                    _sl = max(0, min(_slider.value(),
-                                     self._acquired_data.shape[1] - 1))
-                _base = np.asarray(self._acquired_data[0, _sl, :, :], dtype=float)
+                _base = None
                 if getattr(self, "_roi_bg_img", None) is not None:
                     _base = np.asarray(self._roi_bg_img, dtype=float)
-                if _base.shape != data.shape[:2]:
-                    from scipy.ndimage import zoom as _zoom
-                    zy = data.shape[0] / max(_base.shape[0], 1)
-                    zx = data.shape[1] / max(_base.shape[1], 1)
-                    _base = _zoom(_base, (zy, zx), order=1)
-                ax.imshow(_base, cmap="gray", origin="upper")
+                elif self._acquired_data is not None:
+                    _sl = 0
+                    _slider = getattr(self, '_acq_slice_slider', None)
+                    if self._acquired_data.shape[1] > 1 and _slider is not None:
+                        _sl = max(0, min(_slider.value(),
+                                         self._acquired_data.shape[1] - 1))
+                    _base = np.asarray(self._acquired_data[0, _sl, :, :], dtype=float)
+                if _base is not None:
+                    if _base.shape != data.shape[:2]:
+                        from scipy.ndimage import zoom as _zoom
+                        zy = data.shape[0] / max(_base.shape[0], 1)
+                        zx = data.shape[1] / max(_base.shape[1], 1)
+                        _base = _zoom(_base, (zy, zx), order=1)
+                    ax.imshow(_base, cmap="gray", origin="upper")
             except Exception:
                 pass
 

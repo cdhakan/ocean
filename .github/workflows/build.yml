@@ -69,6 +69,16 @@ jobs:
           OCEAN_PULSEQ_LIBRARY: ${{ github.workspace }}\pulseq-cest-library\seq-library
         run: pyinstaller OCEAN.spec --clean --noconfirm --log-level WARN
 
+      # pypulseq reads <bundle>/VERSION at import; a build without it only
+      # fails later, when a user writes a sequence — so assert it here.
+      - name: Check bundled pypulseq VERSION file
+        shell: pwsh
+        run: |
+          if (!(Test-Path dist\OCEAN\_internal\VERSION)) {
+            Write-Error "dist\OCEAN\_internal\VERSION is missing - pypulseq would crash at import"; exit 1
+          }
+          Get-Content dist\OCEAN\_internal\VERSION
+
       - name: Zip dist/OCEAN → OCEAN.zip
         shell: pwsh
         run: Compress-Archive -Path dist\OCEAN -DestinationPath dist\OCEAN.zip
@@ -79,96 +89,9 @@ jobs:
           path: dist/OCEAN.zip
           retention-days: 30
 
-  build-macos:
-    name: "Build · macOS .dmg"
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Install SWIG + create-dmg
-        env:
-          HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
-        run: brew install swig create-dmg
-
-      - name: Install Python dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pyinstaller pyinstaller-hooks-contrib
-          pip install itk-elastix
-          pip install -e open-py-cest-mrf/
-
-      - name: Compile BMCSimulator + pypulseq (C++ core, vendored)
-        working-directory: open-py-cest-mrf/cest_mrf/sim_lib
-        shell: bash
-        run: |
-          pip install --upgrade pip wheel "setuptools<81"   # setuptools 81 removed pkg_resources.NullProvider, which PyInstaller's pyi_rth_pkgres runtime hook needs
-          rm -rf build dist *.egg-info
-          rm -f BMCSimulator.py BMCSimulator_wrap.cpp *.so *.pyd
-          python setup.py build_ext --inplace
-          pip install . --no-deps --no-build-isolation
-          python "$GITHUB_WORKSPACE/.github/fix_bmc_encoding.py" ./BMCSimulator.py
-          cd "$GITHUB_WORKSPACE/open-py-cest-mrf/cest_mrf/pypulseq"
-          pip install . --no-deps --no-build-isolation
-
-      - name: Fetch pulseq-CEST library
-        run: git clone --depth 1 ${{ env.PULSEQ_LIB_REPO }} pulseq-cest-library
-
-      - name: Generate macOS icon (.icns)
-        run: |
-          if [ -f "icon.png" ] && [ ! -f "assets/AppIcon.icns" ]; then
-            mkdir -p assets/AppIcon.iconset
-            for s in 16 32 64 128 256 512; do
-              sips -z $s $s icon.png --out "assets/AppIcon.iconset/icon_${s}x${s}.png" >/dev/null
-              sips -z $((s*2)) $((s*2)) icon.png --out "assets/AppIcon.iconset/icon_${s}x${s}@2x.png" >/dev/null
-            done
-            iconutil -c icns assets/AppIcon.iconset -o assets/AppIcon.icns
-          fi
-
-      - name: Build with PyInstaller
-        env:
-          OCEAN_PULSEQ_LIBRARY: ${{ github.workspace }}/pulseq-cest-library/seq-library
-        run: pyinstaller OCEAN.spec --clean --noconfirm --log-level WARN
-
-      - name: Smoke-test the built app (fail the build if it crashes on startup)
-        run: |
-          set +e
-          OUT=$(QT_QPA_PLATFORM=offscreen timeout 30 dist/OCEAN.app/Contents/MacOS/OCEAN 2>&1)
-          echo "$OUT" | head -40
-          if echo "$OUT" | grep -qiE "Failed to execute script|NullProvider|ModuleNotFoundError|Traceback \(most recent"; then
-            echo "::error::OCEAN crashed on startup — see log above"; exit 1
-          fi
-          echo "startup smoke test passed"
-
-      - name: Determine version string
-        id: version
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "value=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=dev" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create DMG
-        run: |
-          DMG="dist/OCEAN.dmg"
-          create-dmg --volname "OCEAN" --window-pos 200 120 \
-            --window-size 660 420 --icon-size 100 --icon "OCEAN.app" 180 200 \
-            --hide-extension "OCEAN.app" --app-drop-link 460 200 \
-            "${DMG}" "dist/OCEAN.app" \
-          || hdiutil create -volname "OCEAN" -srcfolder "dist/OCEAN.app" \
-               -ov -format UDZO "${DMG}"
-          echo "DMG_PATH=${DMG}" >> "$GITHUB_ENV"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: OCEAN-macOS
-          path: ${{ env.DMG_PATH }}
-          retention-days: 30
+  # NOTE: the macOS .dmg is NOT built here — it is built on the maintainer's Mac
+  # with build_dmg.sh and attached to the GitHub release by hand (gh release
+  # create / upload).  CI produces the Windows .zip and the Linux .tar.gz only.
 
   build-linux:
     name: "Build · Linux tar.gz"
@@ -212,6 +135,9 @@ jobs:
           OCEAN_PULSEQ_LIBRARY: ${{ github.workspace }}/pulseq-cest-library/seq-library
         run: pyinstaller OCEAN.spec --clean --noconfirm --log-level WARN
 
+      - name: Check bundled pypulseq VERSION file
+        run: test -f dist/OCEAN/_internal/VERSION && cat dist/OCEAN/_internal/VERSION
+
       - name: Smoke-test the built app (fail the build if it crashes on startup)
         run: |
           set +e
@@ -233,7 +159,7 @@ jobs:
 
   release:
     name: "Publish GitHub Release"
-    needs: [build-windows, build-macos, build-linux]
+    needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -242,24 +168,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: OCEAN-Windows, path: release-files/ }
       - uses: actions/download-artifact@v4
-        with: { name: OCEAN-macOS, path: release-files/ }
-      - uses: actions/download-artifact@v4
         with: { name: OCEAN-Linux, path: release-files/ }
-      - name: Create GitHub Release
+      # The release for this tag normally already exists (the .dmg is uploaded
+      # to it from the maintainer's Mac); this step replaces the Windows/Linux
+      # assets on it (same-name assets are overwritten), or creates it if absent.
+      # Only the assets are touched: no name/body/notes are passed, so the
+      # release's existing title and hand-written notes are left as they are
+      # (OCEAN.dmg uploaded from the Mac is not touched either).
+      - name: Publish Windows + Linux artefacts to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "OCEAN ${{ github.ref_name }}"
-          body: |
-
-            | Platform | File |
-            |----------|------|
-            | Windows 10/11 | `OCEAN.zip` |
-            | macOS 11+ | `OCEAN.dmg` |
-            | Linux x86_64 | `OCEAN.tar.gz` |
-
-            > **Windows:** SmartScreen may warn ("Unknown publisher") on first run —
-            > click **More info → Run anyway** (normal for unsigned apps).
-            > **macOS:** right-click → **Open** the first time (unsigned app).
           files: release-files/*
-          generate_release_notes: true

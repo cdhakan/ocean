@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QLineEdit, QGroupBox, QSizePolicy, QDoubleSpinBox, QSpinBox,
     QCheckBox, QInputDialog, QMessageBox,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from scipy.ndimage import (
     gaussian_filter, binary_closing, binary_fill_holes, binary_opening,
     binary_erosion, binary_dilation, binary_propagation,
@@ -219,6 +219,43 @@ def _largest_cc(mask: np.ndarray) -> np.ndarray:
     counts = np.bincount(lbl.ravel())
     counts[0] = 0
     return lbl == int(counts.argmax())
+
+
+def signal_foreground_mask(ref, sigma: float = 1.5, min_frac: float = 0.02):
+    """Boolean foreground (signal) mask of a reference image, separating the
+    object from the low-SNR air background via Otsu on a smoothed, normalised
+    copy.  Used to suppress the noisy background in parametric maps when no
+    outline ROI is drawn so the map shows only over the actual image.  Returns
+    an all-True mask if a sensible foreground cannot be found."""
+    from scipy.ndimage import (gaussian_filter, binary_fill_holes,
+                               binary_opening, binary_closing, label)
+    a = np.asarray(ref, dtype=float)
+    if a.ndim > 2:
+        a = a[..., 0]
+    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+    if a.size == 0 or float(a.max()) <= float(a.min()):
+        return np.ones(a.shape, dtype=bool)
+    sm = gaussian_filter(a, sigma)
+    n = (sm - sm.min()) / (sm.max() - sm.min() + 1e-12)
+    thr = _otsu_threshold(n)
+    fg = n > (thr if np.isfinite(thr) and thr > 0 else 0.1)
+    try:
+        # Clean to a single solid object: close small gaps, keep the largest
+        # connected component, fill holes, and open away isolated speckle noise.
+        fg = binary_closing(fg, _disk(2))
+        lbl, nl = label(fg)
+        if nl > 1:
+            counts = np.bincount(lbl.ravel()); counts[0] = 0
+            fg = lbl == int(counts.argmax())
+        fg = binary_fill_holes(fg)
+        fg = binary_opening(fg, _disk(1))
+    except Exception:
+        pass
+    # Guard against degenerate thresholds (nearly empty / nearly full).
+    frac = float(fg.mean())
+    if frac < min_frac or frac > 0.98:
+        return np.ones(a.shape, dtype=bool)
+    return fg
 
 
 def detect_brain_outline(img: np.ndarray, gauss_sigma: float = None,
@@ -458,7 +495,7 @@ def detect_phantom_tubes(
     return rois
 
 
-def roi_union_mask(rois, shape, exclude=("Phantom_outline", "Brain_outline")):
+def roi_union_mask(rois, shape, exclude=("Phantom_outline", "Brain_outline", "Mouse_Brain_outline")):
     """Boolean OR of every drawn ROI's mask (excluding the whole-phantom / brain
     outline ROIs), nearest-neighbour-resized to ``shape`` (H, W).
 
@@ -495,17 +532,18 @@ def choose_background_image(parent, scan_paths, pv360: bool = False):
       ('keep', None)      — cancelled (no change)."""
     from PyQt6.QtWidgets import (
         QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-        QPushButton, QDialogButtonBox, QFileDialog, QMessageBox,
+        QPushButton, QDialogButtonBox, QFileDialog, QMessageBox, QSpinBox,
     )
-    from my_gui.bruker_reader import load_scan_first_frame
+    from my_gui.bruker_reader import load_scan_stack
 
     d = QDialog(parent)
     d.setWindowTitle("Background image")
-    d.resize(460, 400)
+    d.resize(460, 440)
     lay = QVBoxLayout(d)
     lay.addWidget(QLabel(
         "Choose the image shown in gray behind the ROI colours\n"
-        "(from the assigned Scan-Directory scans, or browse to any):"))
+        "(pick a scan, then its slice / frame; this background is used for both\n"
+        "'ROIs + Bkg' and 'ROIs only'):"))
     lst = QListWidget()
     for k, p in (scan_paths or {}).items():
         if not p:
@@ -519,6 +557,18 @@ def choose_background_image(parent, scan_paths, pv360: bool = False):
         _hint.setStyleSheet(f"color:{dc('#999', '#555555')};font-size:11px;")
         lay.addWidget(_hint)
 
+    # Slice / Frame selectors (enabled once a scan with >1 slice/frame is loaded).
+    sp_row = QHBoxLayout()
+    sp_row.addWidget(QLabel("Slice:"))
+    spin_slice = QSpinBox(); spin_slice.setMinimum(1); spin_slice.setMaximum(1)
+    spin_slice.setEnabled(False); sp_row.addWidget(spin_slice)
+    sp_row.addSpacing(12)
+    sp_row.addWidget(QLabel("Frame/Echo:"))
+    spin_frame = QSpinBox(); spin_frame.setMinimum(1); spin_frame.setMaximum(1)
+    spin_frame.setEnabled(False); sp_row.addWidget(spin_frame)
+    sp_row.addStretch()
+    lay.addLayout(sp_row)
+
     row = QHBoxLayout()
     btn_browse = QPushButton("Browse folder…")
     btn_default = QPushButton("Use default (this scan)")
@@ -529,37 +579,51 @@ def choose_background_image(parent, scan_paths, pv360: bool = False):
     lay.addWidget(bb)
 
     out = {"mode": "keep", "img": None}
+    state = {"stack": None}
 
-    def _load(p):
-        img = load_scan_first_frame(p, pv360=pv360)
-        if img is None:
+    def _load_stack(p):
+        stack, nsl, nit = load_scan_stack(p, pv360=pv360)
+        if stack is None:
             QMessageBox.warning(d, "Can't read",
                                 f"Could not read a 2dseq image from:\n{p}")
-            return
-        out["mode"] = "set"; out["img"] = img; d.accept()
+            return False
+        state["stack"] = stack
+        spin_slice.setMaximum(max(nsl, 1)); spin_slice.setValue(1)
+        spin_slice.setEnabled(nsl > 1)
+        spin_frame.setMaximum(max(nit, 1)); spin_frame.setValue(1)
+        spin_frame.setEnabled(nit > 1)
+        return True
 
     def _browse():
         p = QFileDialog.getExistingDirectory(
             d, "Select a Bruker scan folder (…/pdata/1)")
         if p:
-            _load(p)
+            _load_stack(p)
 
     def _use_default():
         out["mode"] = "default"; d.accept()
 
     def _ok():
-        it = lst.currentItem()
-        if it is None:
-            QMessageBox.information(
-                d, "Pick a scan", "Select a scan, or use Browse / Use default.")
-            return
-        _load(it.data(Qt.ItemDataRole.UserRole))
+        if state["stack"] is None:
+            it = lst.currentItem()
+            if it is None:
+                QMessageBox.information(
+                    d, "Pick a scan", "Select a scan, or use Browse / Use default.")
+                return
+            if not _load_stack(it.data(Qt.ItemDataRole.UserRole)):
+                return
+        st = state["stack"]
+        si = min(max(spin_slice.value() - 1, 0), st.shape[2] - 1)
+        fi = min(max(spin_frame.value() - 1, 0), st.shape[3] - 1)
+        out["mode"] = "set"; out["img"] = st[:, :, si, fi]; d.accept()
 
     btn_browse.clicked.connect(_browse)
     btn_default.clicked.connect(_use_default)
     bb.accepted.connect(_ok)
     bb.rejected.connect(d.reject)
-    lst.itemDoubleClicked.connect(lambda it: _load(it.data(Qt.ItemDataRole.UserRole)))
+    # Selecting a scan loads its stack and populates the slice/frame ranges.
+    lst.currentItemChanged.connect(
+        lambda cur, _prev: cur and _load_stack(cur.data(Qt.ItemDataRole.UserRole)))
     d.exec()
     return out["mode"], out["img"]
 
@@ -615,6 +679,17 @@ class ROICanvas(FigureCanvas):
         self._wl_cids: list = []               # mpl event connections
         self._wl_drag: Optional[dict] = None   # in-progress drag anchor/state
         self._wl_callback = None               # notified with (vmin, vmax) on release
+
+        # Parcellation legend/hover only on the ROI-manager canvas (not the
+        # read-only copies in other tabs).  ROIPanel sets this True.
+        self._show_parc_legend = False
+        # Parcellation hover: name the region under the cursor.
+        self._parc_hover_annot = None
+        self._parc_hover_last = None
+        try:
+            self.mpl_connect("motion_notify_event", self._on_parc_hover)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public display methods
@@ -1455,14 +1530,26 @@ class ROICanvas(FigureCanvas):
                     except Exception:
                         pass  # fall back to original mask
 
-            # Brain skull-strip mask → filled semi-transparent overlay so it
-            # reads like the deep-extraction result, not just a boundary line.
-            if roi.name == "Brain_outline":
+            # Filled semi-transparent overlay for brain-extraction and atlas-
+            # parcellation ROIs so they read as colored PANELS, not just a line.
+            _is_parc = roi.name.startswith("Parc: ")
+            if roi.name in ("Brain_outline", "Mouse_Brain_outline") or _is_parc:
                 try:
                     self._ax.contourf(draw_mask.astype(float), levels=[0.5, 1.5],
-                                      colors=[roi.color], alpha=0.35)
+                                      colors=[roi.color],
+                                      alpha=0.5 if _is_parc else 0.35)
                 except Exception:
                     pass
+            if _is_parc:
+                # Colored panel + thin boundary; skip the heavy selected-highlight
+                # so all parcellation regions show together as a colour map.
+                try:
+                    cs = self._ax.contour(draw_mask.astype(float), levels=[0.5],
+                                          colors=[roi.color], linewidths=0.8)
+                    self._roi_patches[roi.name] = [cs]
+                except Exception:
+                    self._roi_patches[roi.name] = []
+                return
 
             # Highlighted ROI: draw bright white outline + thick color contour
             # Store ContourSet objects directly — matplotlib 3.8+ removed .collections
@@ -1520,6 +1607,72 @@ class ROICanvas(FigureCanvas):
                 self._setup_dc_annot()
         for roi in self._rois:
             self._draw_single_roi(roi)
+        self._draw_parc_legend()
+
+    def _draw_parc_legend(self):
+        """Label the atlas-parcellation regions by colour (legend, upper-left).
+        Only on the ROI-manager canvas — suppressed in the other tabs' copies."""
+        if not getattr(self, "_show_parc_legend", False):
+            return
+        if not hasattr(self, "_ax") or self._ax is None:
+            return
+        parc = [r for r in self._rois if getattr(r, "name", "").startswith("Parc: ")]
+        if not parc:
+            return
+        try:
+            from matplotlib.patches import Patch
+            handles = [Patch(facecolor=r.color, edgecolor="none", alpha=0.75,
+                             label=r.name[len("Parc: "):]) for r in parc]
+            leg = self._ax.legend(
+                handles=handles, loc="upper left", fontsize=12, ncol=1,
+                framealpha=0.75, facecolor="white", edgecolor="0.4",
+                labelcolor="black", title="Parcellation", title_fontsize=13,
+                borderpad=0.6, labelspacing=0.5, handlelength=1.8,
+                handleheight=1.4)
+            leg.set_zorder(30)
+        except Exception:
+            pass
+
+    def _on_parc_hover(self, event):
+        """Show the parcellation region name under the cursor (top of the axes).
+        Only on the ROI-manager canvas — suppressed in the other tabs' copies."""
+        if not getattr(self, "_show_parc_legend", False):
+            return
+        parc = [r for r in getattr(self, "_rois", [])
+                if getattr(r, "name", "").startswith("Parc: ")]
+        ax = getattr(self, "_ax", None)
+        if not parc or ax is None:
+            return
+        name = ""
+        if event.inaxes is ax and event.xdata is not None and event.ydata is not None:
+            cc, rr = int(round(event.xdata)), int(round(event.ydata))
+            for r in parc:
+                m = np.asarray(r.mask, dtype=bool)
+                if self._img_shape is not None and m.shape[:2] != tuple(self._img_shape[:2]):
+                    try:
+                        from scipy.ndimage import zoom
+                        ih, iw = self._img_shape[:2]
+                        m = zoom(m.astype(float),
+                                 (ih / max(m.shape[0], 1), iw / max(m.shape[1], 1)),
+                                 order=0) > 0.5
+                    except Exception:
+                        pass
+                if 0 <= rr < m.shape[0] and 0 <= cc < m.shape[1] and m[rr, cc]:
+                    name = r.name[len("Parc: "):]
+                    break
+        _stale = (self._parc_hover_annot is None
+                  or self._parc_hover_annot.axes is not ax)
+        if name == self._parc_hover_last and not _stale:
+            return                                  # no change → skip redraw
+        self._parc_hover_last = name
+        if _stale:
+            self._parc_hover_annot = ax.annotate(
+                "", xy=(0.5, 0.985), xycoords="axes fraction", ha="center", va="top",
+                fontsize=10, color="black", zorder=45,
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.4", alpha=0.9))
+        self._parc_hover_annot.set_text(name)
+        self._parc_hover_annot.set_visible(bool(name))
+        self.draw_idle()
 
     # ------------------------------------------------------------------
     # ROI management
@@ -1640,6 +1793,28 @@ class ROICanvas(FigureCanvas):
         self.draw_idle()
 
 
+class _ParcWorker(QThread):
+    """Runs the (slow) atlas parcellation off the UI thread.
+    Emits done(coarse_map | None, info_dict | error_str)."""
+    done = pyqtSignal(object, object)
+
+    def __init__(self, image, brain_mask, ap_level, plane):
+        super().__init__()
+        self._img = image
+        self._bm = brain_mask
+        self._ap = ap_level
+        self._plane = plane
+
+    def run(self):
+        try:
+            import my_gui.mouse_parcellation as mp
+            coarse, info = mp.parcellate_slice(
+                self._img, self._bm, ap_level=self._ap, plane=self._plane)
+            self.done.emit(coarse, info)
+        except Exception as exc:
+            self.done.emit(None, str(exc))
+
+
 # ---------------------------------------------------------------------------
 # ROIPanel
 # ---------------------------------------------------------------------------
@@ -1648,6 +1823,11 @@ class ROIPanel(QWidget):
     def __init__(self, canvas: ROICanvas, parent=None):
         super().__init__(parent)
         self._canvas = canvas
+        # Parcellation legend/hover live only on the ROI-manager canvas.
+        try:
+            self._canvas._show_parc_legend = True
+        except Exception:
+            pass
         self._connected_canvas = None   # prevent double-connect
         # Optional callback set by external code (e.g. ROITab) to show a
         # parametric-map overlay masked to the currently detected tubes.
@@ -1830,6 +2010,63 @@ class ROIPanel(QWidget):
         # classical Otsu outline on the current slice.  A tab provides the 3-D
         # volume via set_brain_volume_getter().
         self._brain_volume_getter = None
+
+        # Mouse / rodent brain outline — separate backend (MASMAT multi-atlas
+        # first, ONNX mouse model fallback) so the human skull-strip above is
+        # left completely untouched.  Distinct colour + ROI name.
+        self._mouse_brain_btn = QPushButton("Detect Mice Brain Outline")
+        self._mouse_brain_btn.setFixedHeight(28)
+        self._mouse_brain_btn.setToolTip(
+            "Skull-strip a mouse / rodent brain and add it as an outline ROI.\n"
+            "Uses MASMAT (multi-atlas, NiftyReg) when configured, otherwise a\n"
+            "mouse ONNX model.  Human brain detection is unaffected.")
+        self._mouse_brain_btn.setStyleSheet(
+            "QPushButton { border: 1px solid #a14d8c; border-radius: 4px; }"
+            "QPushButton:hover { background: #4a1f3f; }")
+        self._mouse_brain_btn.clicked.connect(self._detect_mouse_brain_outline)
+        phantom_layout.addWidget(self._mouse_brain_btn)
+        self._mouse_brain_mask_3d = None
+
+        # Atlas parcellation (coronal single-atlas, NiftyReg) of the mouse brain —
+        # labels the detected brain into major regions, each added as an ROI.
+        _parc_row = QHBoxLayout()
+        self._parc_btn = QPushButton("Parcellate Brain (atlas)")
+        self._parc_btn.setFixedHeight(28)
+        self._parc_btn.setToolTip(
+            "Label the mouse brain into major regions (cortex, hippocampus,\n"
+            "thalamus, cerebellum, …) by registering a coronal atlas slice, and\n"
+            "add each region as an ROI (→ per-region stats in every tab).\n"
+            "Needs NiftyReg + a mouse atlas.  2-D single-atlas result is approximate.")
+        self._parc_btn.setStyleSheet(
+            "QPushButton { border: 1px solid #a14d8c; border-radius: 4px; }"
+            "QPushButton:hover { background: #4a1f3f; }")
+        self._parc_btn.clicked.connect(self._parcellate_mouse_brain)
+        _parc_row.addWidget(self._parc_btn, 1)
+        _parc_row.addWidget(QLabel("A-P:"))
+        self._parc_ap_spin = QSpinBox()
+        self._parc_ap_spin.setRange(0, 127)
+        self._parc_ap_spin.setValue(0)
+        self._parc_ap_spin.setToolTip(
+            "Atlas coronal (anterior–posterior) level.\n"
+            "0 = auto-match; set a value to fix a bad auto-match.")
+        _parc_row.addWidget(self._parc_ap_spin)
+        phantom_layout.addLayout(_parc_row)
+        # Slice plane + 2-D/3-D mode for brain extraction + parcellation.
+        _parc_row2 = QHBoxLayout()
+        _parc_row2.addWidget(QLabel("Plane:"))
+        self._parc_plane = QComboBox()
+        self._parc_plane.addItems(["Coronal", "Axial", "Sagittal"])
+        self._parc_plane.setToolTip(
+            "Acquisition / atlas slice plane for parcellation (match your scan).")
+        _parc_row2.addWidget(self._parc_plane, 1)
+        _parc_row2.addWidget(QLabel("Mode:"))
+        self._parc_mode = QComboBox()
+        self._parc_mode.addItems(["2D", "3D"])
+        self._parc_mode.setToolTip(
+            "2D = current slice;  3D = loaded 3-D brain volume (when available).")
+        _parc_row2.addWidget(self._parc_mode)
+        phantom_layout.addLayout(_parc_row2)
+        self._parc_worker = None
 
         # NOTE: "Mask Tubes → Overlay Map" button removed at user request (as of
         # now).  The _mask_tubes / _mask_tubes_fn handlers are kept below so the
@@ -2134,6 +2371,233 @@ class ROIPanel(QWidget):
                 cb()
             except Exception:
                 pass
+
+    # ── Mouse / rodent brain (separate backend; human path above is untouched) ──
+    # Minimum slices for the 3-D atlas-registration path.  A 2-D multi-slice
+    # Bruker acquisition (e.g. a 3-slice CEST/anatomical) is NOT a true volume
+    # and must not be registered to the full 3-D mouse atlas — it goes 2-D.
+    _MOUSE_MIN_SLICES_3D = 16
+
+    def _mouse_mask_mbe(self):
+        """MBE (MouseBrainExtractor) deep 2-D skull-strip.  Runs on a loaded
+        few-slice stack when the volume-getter provides one with a current slice
+        index (cached so the outline follows slice scrolling), otherwise on the
+        current 2-D display.  Returns a 2-D mask for the current view, or None if
+        MBE produced nothing."""
+        from my_gui.mouse_brain_extractor import run_mbe_2d
+        self._mouse_brain_mask_3d = None
+        tgt = tuple(np.asarray(self._canvas._img_data).shape[:2])
+        getter = getattr(self, "_brain_volume_getter", None)
+        got = getter() if callable(getter) else None
+        vol, sl = (got if isinstance(got, tuple) else (got, None)) if got is not None else (None, None)
+        if vol is not None:
+            vol = np.asarray(vol, dtype=float)
+        # Use a loaded few-slice stack (with a known current index) when its
+        # in-plane matches the display; else just the current 2-D slice.
+        if (vol is not None and vol.ndim == 3 and vol.shape[:2] == tgt
+                and 1 <= vol.shape[2] <= 64 and sl is not None):
+            mask3d = run_mbe_2d(vol)                       # (H, W, S) bool
+            self._mouse_brain_mask_3d = mask3d
+            idx = max(0, min(int(sl), mask3d.shape[2] - 1))
+            m2d = mask3d[:, :, idx]
+        else:
+            m2d = run_mbe_2d(np.asarray(self._canvas._img_data, dtype=float))
+        return m2d if np.asarray(m2d).any() else None
+
+    def _mouse_brain_mask_2d(self):
+        """Atlas path only: run the mouse backend (MASMAT → ONNX) on a TRUE 3-D
+        volume and return a 2-D mask aligned to the current display, caching the
+        3-D mask.  Returns None if the result is empty; raises
+        MouseBackendUnavailable when there is no true 3-D volume or no backend
+        (the caller then falls back to the 2-D per-slice method)."""
+        from my_gui.mouse_brain_extractor import (
+            extract_mouse_brain_mask, MouseBackendUnavailable)
+        self._mouse_brain_mask_3d = None
+        getter = getattr(self, "_brain_volume_getter", None)
+        got = getter() if callable(getter) else None
+        if got is None:
+            raise MouseBackendUnavailable("no 3-D volume loaded")
+        vol, _sl = got if isinstance(got, tuple) else (got, None)
+        vol = np.asarray(vol, dtype=float)
+        if vol.ndim != 3 or min(vol.shape) < self._MOUSE_MIN_SLICES_3D:
+            raise MouseBackendUnavailable(
+                f"not a true 3-D volume (shape {getattr(vol, 'shape', None)})")
+        mask3d = extract_mouse_brain_mask(vol, 0.5)        # (H, W, D) bool
+        self._mouse_brain_mask_3d = mask3d
+        sl = int(mask3d.shape[2] // 2)
+        m2d = mask3d[:, :, sl]
+        tgt = np.asarray(self._canvas._img_data).shape[:2]
+        if m2d.shape != tgt:
+            from scipy.ndimage import zoom
+            m2d = zoom(m2d.astype(float),
+                       (tgt[0] / max(m2d.shape[0], 1), tgt[1] / max(m2d.shape[1], 1)),
+                       order=0) > 0.5
+        return m2d if np.asarray(m2d).any() else None
+
+    def _detect_mouse_brain_outline(self):
+        """Skull-strip a mouse / rodent brain and add it as its own ROI.
+
+        Backend order: (1) MBE deep 2-D model (MouseBrainExtractor) — best for
+        2-D / few-slice Bruker data; (2) 3-D atlas (MASMAT/NiftyReg or ONNX) for
+        a true 3-D volume; (3) the contrast/geometry 2-D skull-strip on the
+        current slice (the shared method the human button uses).  The human
+        'Detect Brain Outline' path and its ROI are untouched."""
+        from my_gui.mouse_brain_extractor import MouseBackendUnavailable, mbe_available
+        if self._canvas._img_data is None:
+            QMessageBox.information(self, "No image", "Load an image first.")
+            return
+        # Remove an existing Mouse_Brain_outline (avoid duplicates).
+        for r in [r for r in self._canvas.get_rois() if r.name == "Mouse_Brain_outline"]:
+            self._canvas.remove_roi(r.name)
+            for i in range(self._roi_list.count()):
+                if self._roi_list.item(i).text() == "Mouse_Brain_outline":
+                    self._roi_list.takeItem(i)
+                    break
+        mask = None
+        # 1. MBE deep 2-D model (preferred for 2-D / few-slice mouse data).
+        if mbe_available():
+            try:
+                mask = self._mouse_mask_mbe()
+            except Exception:
+                mask = None      # MBE hiccup → fall through, never a dead button
+        # 2. 3-D atlas path (true volume + NiftyReg/atlas or ONNX).
+        if mask is None:
+            try:
+                mask = self._mouse_brain_mask_2d()
+            except MouseBackendUnavailable:
+                mask = None
+            except Exception as exc:
+                QMessageBox.warning(self, "Mouse brain detection failed", str(exc))
+                return
+        # 3. 2-D fallback: contrast/geometry skull-strip on the current slice.
+        if mask is None:
+            self._mouse_brain_mask_3d = None
+            try:
+                mask = detect_brain_outline(self._canvas._img_data)
+            except Exception as exc:
+                QMessageBox.warning(self, "Mouse brain detection failed", str(exc))
+                return
+        if mask is None or not np.asarray(mask).any():
+            QMessageBox.information(
+                self, "No brain found",
+                "Mouse brain detection did not find a brain region.\n"
+                "This works on brain slices — for phantoms use 'Detect Outline'.")
+            return
+        roi = ROI(
+            name="Mouse_Brain_outline",
+            roi_type="auto",
+            mask=mask,
+            color="#ff6ec7",  # pink — distinct from the teal human brain outline
+        )
+        self._canvas._rois.append(roi)
+        self._canvas._draw_single_roi(roi)
+        self._canvas.draw()
+        self._roi_list.addItem(roi.name)
+        self._canvas.roi_added.emit(roi)
+        self._show_stats_for_roi(roi)
+        cb = getattr(self, "_on_brain_detected", None)
+        if callable(cb):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    # ── Atlas parcellation (coronal/axial/sagittal single-atlas, NiftyReg) ──
+    def _parcellate_brain_mask(self):
+        """Brain mask for the current display: an existing brain-outline ROI
+        (rescaled), else a fresh MBE skull-strip.  Returns a 2-D bool mask or
+        None."""
+        img = np.asarray(self._canvas._img_data)
+        for r in self._canvas.get_rois():
+            if getattr(r, "name", "") in ("Mouse_Brain_outline", "Brain_outline"):
+                m = np.asarray(r.mask, dtype=bool)
+                if m.shape != img.shape[:2]:
+                    from scipy.ndimage import zoom
+                    m = zoom(m.astype(float),
+                             (img.shape[0] / max(m.shape[0], 1),
+                              img.shape[1] / max(m.shape[1], 1)), order=0) > 0.5
+                if m.any():
+                    return m
+        try:
+            from my_gui.mouse_brain_extractor import run_mbe_2d, mbe_available
+            if mbe_available():
+                m = run_mbe_2d(np.asarray(img, dtype=float))
+                if m is not None and np.asarray(m).any():
+                    return np.asarray(m, dtype=bool)
+        except Exception:
+            pass
+        return None
+
+    def _parcellate_mouse_brain(self):
+        """Register an atlas slice to the detected brain and add each coarse
+        region as an ROI (→ per-region stats in every tab)."""
+        from my_gui.mouse_parcellation import available
+        if self._canvas._img_data is None:
+            QMessageBox.information(self, "No image", "Load an image first.")
+            return
+        if not available():
+            QMessageBox.information(
+                self, "Parcellation unavailable",
+                "Atlas parcellation needs NiftyReg + a mouse atlas with labels.\n"
+                "• NiftyReg:  conda create -n niftyreg -c conda-forge niftyreg\n"
+                "• Atlas:     run fetch_mouse_atlas.sh (template/ + label/ + mask/).")
+            return
+        if (getattr(self, "_parc_worker", None) is not None
+                and self._parc_worker.isRunning()):
+            return
+        bm = self._parcellate_brain_mask()
+        if bm is None:
+            QMessageBox.information(
+                self, "No brain",
+                "Detect the mouse brain first (Detect Mice Brain Outline), or draw "
+                "a Brain_outline / Mouse_Brain_outline ROI.")
+            return
+        if self._parc_mode.currentText() == "3D":
+            QMessageBox.information(
+                self, "3-D parcellation",
+                "3-D parcellation needs a true 3-D brain volume (not available for "
+                "this 2-D slice). Running 2-D on the current slice instead.")
+        plane = self._parc_plane.currentText().lower()
+        self._parc_btn.setEnabled(False)
+        self._parc_btn.setText("Parcellating…")
+        self._parc_worker = _ParcWorker(
+            np.asarray(self._canvas._img_data, dtype=float), bm,
+            int(self._parc_ap_spin.value()), plane)
+        self._parc_worker.done.connect(self._on_parc_done)
+        self._parc_worker.start()
+
+    def _on_parc_done(self, coarse, info):
+        self._parc_btn.setEnabled(True)
+        self._parc_btn.setText("Parcellate Brain (atlas)")
+        if coarse is None:
+            QMessageBox.warning(self, "Parcellation failed", str(info))
+            return
+        import my_gui.mouse_parcellation as mp
+        # Remove previous parcellation ROIs.
+        for r in [r for r in self._canvas.get_rois()
+                  if getattr(r, "name", "").startswith("Parc: ")]:
+            self._canvas.remove_roi(r.name)
+            for i in range(self._roi_list.count()):
+                if self._roi_list.item(i).text() == r.name:
+                    self._roi_list.takeItem(i)
+                    break
+        regions = mp.region_masks(coarse)
+        for name, (m, col) in regions.items():
+            roi = ROI(name=f"Parc: {name}", roi_type="auto",
+                      mask=np.asarray(m, dtype=bool), color=col)
+            self._canvas._rois.append(roi)
+            self._canvas._draw_single_roi(roi)
+            self._roi_list.addItem(roi.name)
+            self._canvas.roi_added.emit(roi)
+        self._canvas._draw_parc_legend()
+        self._canvas.draw()
+        QMessageBox.information(
+            self, "Parcellation done",
+            f"{len(regions)} regions added as ROIs "
+            f"({info.get('plane', '?')}, atlas level {info['ap_level']}"
+            f"{', flipped' if info.get('flip') else ''}, match r={info['corr']:.2f}).\n"
+            "2-D single-atlas — approximate. If the fit is off, set the A-P level "
+            "or change the Plane and re-run.")
 
     def _detect_tubes(self):
         if self._canvas._img_data is None:

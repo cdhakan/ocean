@@ -20,9 +20,12 @@ from my_gui.theme import dc
 # Module-level fitting helpers
 # ---------------------------------------------------------------------------
 
-def _fit_t1(signal, TRs, full=False, bruker=True):
+def _fit_t1(signal, TRs, full=False, bruker=True, use_offset=True):
     """
     T1 recovery fit:  S(TR) = M0*(1 - exp(-TR/T1)) + c
+
+    ``use_offset`` (default True) keeps the constant ``c`` (noise/baseline
+    offset); when False ``c`` is pinned to ~0 (pure recovery model).
 
     full=False → returns T1 (ms). full=True → returns (M0, T1, c) so the
     plotted curve uses the *actual* fitted amplitude/offset (not data max−min).
@@ -54,8 +57,9 @@ def _fit_t1(signal, TRs, full=False, bruker=True):
     # longest-TR sample (data not fully recovered when TR_max ≈ T1).
     # Bruker: keep the original 1.5× bound (unchanged behaviour).
     _m0_ub = (1.5 if bruker else 3.0) * mx
-    p0     = [mx - mn, 1000.0, mn]
-    bounds = ([0.0, 50.0, 0.0], [_m0_ub, 8000.0, mx])
+    _c_ub  = mx if use_offset else 1e-9       # pin c≈0 when the offset is disabled
+    p0     = [mx - mn, 1000.0, (mn if use_offset else 0.0)]
+    bounds = ([0.0, 50.0, 0.0], [_m0_ub, 8000.0, _c_ub])
 
     try:
         popt, _ = curve_fit(
@@ -68,11 +72,85 @@ def _fit_t1(signal, TRs, full=False, bruker=True):
         return (0.0, 0.0, 0.0) if full else 0.0
 
 
-def _fit_t2(signal, TEs, full=False, bruker=True):
-    """
-    Mono-exponential T2 decay:  S(TE) = M0 * exp(-TE/T2)
+# Cached NLS grid (theExp etc.) keyed on (TIs, T1 grid) so the per-voxel IR map
+# fit does not rebuild the 1..T1max exp matrix for every voxel.
+_IR_NLS_CACHE: dict = {}
 
-    full=False → returns T2 (ms). full=True → returns (M0, T2).
+
+def _ir_nls_setup(TIs, t1_max=5000):
+    """Port of getNLSStruct.m: precompute the T1 grid and exp matrix once."""
+    tVec = np.asarray(TIs, dtype=float).ravel()
+    order = np.argsort(tVec)
+    tVec = tVec[order]
+    N = tVec.size
+    key = (tuple(np.round(tVec, 4)), int(t1_max))
+    c = _IR_NLS_CACHE.get(key)
+    if c is None:
+        T1Vec = np.arange(1, int(t1_max) + 1, dtype=float)          # 1..5000 ms
+        theExp = np.exp(-tVec[:, None] / T1Vec[None, :])            # (N, nT1)
+        sumExp = theExp.sum(axis=0)
+        rhoNorm = (theExp ** 2).sum(axis=0) - (sumExp ** 2) / N
+        rhoNorm = np.where(rhoNorm > 1e-12, rhoNorm, 1e-12)
+        c = (T1Vec, theExp, sumExp, rhoNorm, N)
+        _IR_NLS_CACHE[key] = c
+    return order, c
+
+
+def _fit_t1_ir(signal, TIs, full=False, use_offset=False, bruker=True,
+               t1_max=5000):
+    """
+    Inversion-recovery T1 fit — faithful port of qMRLab's Barral RD-NLS with
+    polarity restoration (rdNlsPr.m / fitT1_IR.m), model ``a + b·exp(−TI/T1)``.
+
+    Reduced-dimension NLS: grid-search T1 over 1..t1_max ms, solve a,b in closed
+    form per T1, and try the two sign-shift (polarity) hypotheses around the
+    signal null, keeping the lower-residual one.  Robust to local minima — unlike
+    a plain exponential fit.  ``use_offset`` is accepted for API symmetry; the
+    baseline is already absorbed by ``a`` so it is a no-op here.
+
+    full=False → T1 (ms);  full=True → (|a|, T1, |b|, idx).  Returns 0 on failure.
+    """
+    data = np.abs(np.asarray(signal, dtype=float)).ravel()
+    TIs  = np.asarray(TIs, dtype=float).ravel()
+    if TIs.size < 3 or data.size != TIs.size or data.max() <= 0:
+        return (0.0, 0.0, 0.0, 0) if full else 0.0
+
+    order, (T1Vec, theExp, sumExp, rhoNorm, N) = _ir_nls_setup(TIs, t1_max)
+    data = data[order]                                   # match sorted TI order
+    minInd = int(np.argmin(data))                        # null index (0-based)
+
+    best = None
+    for ii in (1, 2):
+        k = (minInd + 1) if ii == 1 else minInd          # negate first k points
+        sign = np.ones(N); sign[:k] = -1.0
+        dataTmp = data * sign
+        ySum = dataTmp.sum()
+        rhoTy = dataTmp @ theExp - (sumExp * ySum) / N
+        crit = (rhoTy ** 2) / rhoNorm
+        ind = int(np.argmax(crit))
+        T1Est = float(T1Vec[ind])
+        bEst = rhoTy[ind] / rhoNorm[ind]
+        aEst = (ySum - bEst * sumExp[ind]) / N
+        model = aEst + bEst * np.exp(-TIs[order] / T1Est)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            res = float(np.linalg.norm(1.0 - model / dataTmp) / np.sqrt(N))
+        if not np.isfinite(res):
+            res = 1e18
+        idx = (minInd + 1) if ii == 1 else minInd
+        if best is None or res < best[0]:
+            best = (res, T1Est, abs(aEst), abs(bEst), idx)
+
+    _res, T1Est, aMag, bMag, idx = best
+    return (aMag, T1Est, bMag, idx) if full else T1Est
+
+
+def _fit_t2(signal, TEs, full=False, bruker=True, use_offset=False):
+    """
+    Mono-exponential T2 decay:  S(TE) = M0 * exp(-TE/T2) [+ C]
+
+    ``use_offset`` (default False) adds a constant ``C`` to model the magnitude
+    noise floor (so the decay need not reach 0).  full=False → returns T2 (ms).
+    full=True → returns (M0, T2, C) (C=0 when the offset is disabled).
     bruker=True keeps the original two-point seed + 1.5×max bound; GE/Siemens
     uses a weighted log-linear seed + 3×max bound (more robust for few echoes).
 
@@ -137,20 +215,28 @@ def _fit_t2(signal, TEs, full=False, bruker=True):
         m0_init = float(np.clip(m0_init, 1e-6, 3.0 * mx))
         _m0_ub  = 3.0 * mx
 
-    def residuals(p):
-        M0, T2 = p
-        return M0 * np.exp(-TEs / T2) - signal
-
-    x0     = np.array([m0_init, t2_init])
-    bounds = ([0.0, 1.0], [_m0_ub, 3000.0])
+    if use_offset:
+        def residuals(p):
+            M0, T2, C = p
+            return M0 * np.exp(-TEs / T2) + C - signal
+        x0     = np.array([m0_init, t2_init, 0.0])
+        bounds = ([0.0, 1.0, 0.0], [_m0_ub, 3000.0, mx])
+    else:
+        def residuals(p):
+            M0, T2 = p
+            return M0 * np.exp(-TEs / T2) - signal
+        x0     = np.array([m0_init, t2_init])
+        bounds = ([0.0, 1.0], [_m0_ub, 3000.0])
 
     try:
         res = least_squares(residuals, x0, bounds=bounds,
                             ftol=1e-8, xtol=1e-8, max_nfev=10000)
-        M0_val, T2_val = float(res.x[0]), float(np.clip(res.x[1], 0.0, 3000.0))
-        return (M0_val, T2_val) if full else T2_val
+        M0_val = float(res.x[0])
+        T2_val = float(np.clip(res.x[1], 0.0, 3000.0))
+        C_val  = float(res.x[2]) if use_offset else 0.0
+        return (M0_val, T2_val, C_val) if full else T2_val
     except Exception:
-        return (0.0, 0.0) if full else 0.0
+        return (0.0, 0.0, 0.0) if full else 0.0
 
 
 def _t2_reliability_note(x_label: str, x_vals, t2_val: float) -> str:
@@ -209,13 +295,16 @@ class T1FitWorker(QThread):
     progress = pyqtSignal(int)
     error = pyqtSignal(str)
 
-    def __init__(self, img_2d_ntr, trs_ms, bruker=True):
-        # img_2d_ntr: (Y, X, nTR)
-        # trs_ms: (nTR,) TR values in ms
+    def __init__(self, img_2d_ntr, trs_ms, bruker=True, use_offset=True,
+                 method="vtr"):
+        # img_2d_ntr: (Y, X, nTR)  — or (Y, X, nTI) when method == "ir"
+        # trs_ms: (nTR,) TR values in ms  — or (nTI,) inversion times for IR
         super().__init__()
         self._img = img_2d_ntr
         self._trs = trs_ms
         self._bruker = bruker
+        self._use_offset = use_offset
+        self._method = method        # "vtr" (variable-TR) or "ir" (inversion recovery)
         self._stop = False
 
     def stop(self):
@@ -233,7 +322,12 @@ class T1FitWorker(QThread):
                 for j in range(X):
                     sig = self._img[i, j, :].astype(float)
                     if sig.max() > 0:
-                        t1_map[i, j] = _fit_t1(sig, self._trs, bruker=self._bruker)
+                        if self._method == "ir":
+                            t1_map[i, j] = _fit_t1_ir(sig, self._trs,
+                                                      use_offset=self._use_offset)
+                        else:
+                            t1_map[i, j] = _fit_t1(sig, self._trs, bruker=self._bruker,
+                                                   use_offset=self._use_offset)
                     done += 1
                     if done % max(1, total // 100) == 0:
                         self.progress.emit(int(100 * done / total))
@@ -248,13 +342,14 @@ class T2FitWorker(QThread):
     progress = pyqtSignal(int)
     error = pyqtSignal(str)
 
-    def __init__(self, img_2d_nte, tes_ms, bruker=True):
+    def __init__(self, img_2d_nte, tes_ms, bruker=True, use_offset=False):
         # img_2d_nte: (Y, X, nTE)
         # tes_ms: (nTE,) TE values in ms
         super().__init__()
         self._img = img_2d_nte
         self._tes = tes_ms
         self._bruker = bruker
+        self._use_offset = use_offset
         self._stop = False
 
     def stop(self):
@@ -272,7 +367,8 @@ class T2FitWorker(QThread):
                 for j in range(X):
                     sig = self._img[i, j, :].astype(float)
                     if sig.max() > 0:
-                        t2_map[i, j] = _fit_t2(sig, self._tes, bruker=self._bruker)
+                        t2_map[i, j] = _fit_t2(sig, self._tes, bruker=self._bruker,
+                                               use_offset=self._use_offset)
                     done += 1
                     if done % max(1, total // 100) == 0:
                         self.progress.emit(int(100 * done / total))
@@ -481,6 +577,12 @@ class T1T2Tab(QWidget):
         )
         self.chk_roi_bg.toggled.connect(self._refresh_display)
         disp_row.addWidget(self.chk_roi_bg)
+        # ROIs only / ROIs + Bkg are mutually exclusive (the Bkg… button force-
+        # checks ROIs + Bkg, which would otherwise leave both on).
+        self.chk_roi_only.toggled.connect(
+            lambda on: on and self.chk_roi_bg.setChecked(False))
+        self.chk_roi_bg.toggled.connect(
+            lambda on: on and self.chk_roi_only.setChecked(False))
         # Pick a custom grayscale background for the "ROIs + Bkg" overlay
         self.btn_roi_bg = QPushButton("Bkg…")
         self.btn_roi_bg.setToolTip(
@@ -655,9 +757,13 @@ class T1T2Tab(QWidget):
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("Platform:"))
         self.combo_t1_fmt = QComboBox()
-        self.combo_t1_fmt.addItems(["Bruker", "GE/Siemens"])
+        self.combo_t1_fmt.addItems(["Bruker", "GE/Siemens", "MATLAB (.mat)"])
         self.combo_t1_fmt.currentIndexChanged.connect(self._on_t1_fmt_changed)
         fmt_row.addWidget(self.combo_t1_fmt, stretch=1)
+        fmt_row.addWidget(QLabel("Model:"))
+        self.combo_t1_model = QComboBox()
+        self.combo_t1_model.addItems(["Variable TR", "Inversion Recovery"])
+        fmt_row.addWidget(self.combo_t1_model)
         layout.addLayout(fmt_row)
 
         # ── Folder browser row ──────────────────────────────────────────────
@@ -726,6 +832,11 @@ class T1T2Tab(QWidget):
         _r1run.addWidget(self.btn_run_t1, 1)
         layout.addLayout(_r1run)
 
+        # Shared +C (constant offset) option for BOTH T1 and T2 fits — models the
+        # magnitude noise floor:  T1 S(TR)=M0(1−e^−TR/T1)+C,  T2 S(TE)=M0·e^−TE/T2+C.
+        # The checkbox lives in the ROI Spectra dialog; this flag is the state.
+        self._t12_offset_on = True
+
         # ── Status label ────────────────────────────────────────────────────
         self.lbl_t1_status = QLabel("")
         self.lbl_t1_status.setWordWrap(True)
@@ -743,7 +854,7 @@ class T1T2Tab(QWidget):
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("Platform:"))
         self.combo_t2_fmt = QComboBox()
-        self.combo_t2_fmt.addItems(["Bruker", "GE/Siemens"])
+        self.combo_t2_fmt.addItems(["Bruker", "GE/Siemens", "MATLAB (.mat)"])
         self.combo_t2_fmt.currentIndexChanged.connect(self._on_t2_fmt_changed)
         fmt_row.addWidget(self.combo_t2_fmt, stretch=1)
         layout.addLayout(fmt_row)
@@ -896,16 +1007,27 @@ class T1T2Tab(QWidget):
         row2.addWidget(btn_fa2)
         layout.addLayout(row2)
 
-        # FA row hidden — FA is fixed at 60° internally
+        # Nominal (prescribed) α flip angle for the double-angle PERCENT map:
+        #   B1% = arccos(S_2α / (2·S_α)) / α_nominal × 100.
+        # Default 30° (the common 30°/60° double-angle protocol).
+        _fa_row = QHBoxLayout()
+        _fa_row.addWidget(QLabel("Nominal α:"))
         self.spin_fa = QDoubleSpinBox()
-        self.spin_fa.setRange(0.0, 500.0)
-        self.spin_fa.setValue(60.0)
+        self.spin_fa.setRange(1.0, 180.0)
+        self.spin_fa.setValue(30.0)
         self.spin_fa.setDecimals(1)
         self.spin_fa.setSuffix(" °")
         self.spin_fa.setEnabled(False)
-        self.chk_fa_fixed = QCheckBox("Fixed (60°)")
+        self.spin_fa.setToolTip(
+            "Prescribed (nominal) α flip angle.  B1% = α_actual / this × 100.\n"
+            "For a 30°/60° double-angle acquisition set 30°.")
+        _fa_row.addWidget(self.spin_fa)
+        self.chk_fa_fixed = QCheckBox("Fixed (30°)")
         self.chk_fa_fixed.setChecked(True)
         self.chk_fa_fixed.toggled.connect(self._on_fa_fixed_toggled)
+        _fa_row.addWidget(self.chk_fa_fixed)
+        _fa_row.addStretch()
+        layout.addLayout(_fa_row)
 
         # Restore the group-level layout for the remaining sub-widgets
         layout = grp.layout()
@@ -1257,15 +1379,19 @@ class T1T2Tab(QWidget):
     # ── Format change handlers ────────────────────────────────────────────────
 
     def _on_t1_fmt_changed(self, idx: int):
-        """Show the recovery-time schedule field for GE/Siemens (idx == 1)."""
+        """Show the recovery-time schedule field for GE/Siemens and MATLAB
+        (idx 1 or 2).  The .mat path uses it as an optional schedule override
+        when the TR/TI vector is not stored inside the file.  Update the
+        placeholder so the browse button picks a file for .mat."""
         if hasattr(self, "_t1_sched_frame"):
-            self._t1_sched_frame.setVisible(idx == 1)
+            self._t1_sched_frame.setVisible(idx in (1, 2))
 
     def _on_t2_fmt_changed(self, idx: int):
-        """Show the NIfTI TE fields + prep-time schedule for GE/Siemens."""
+        """Show the NIfTI TE fields + prep-time schedule for GE/Siemens; the
+        schedule field (optional override) also shows for MATLAB (idx 2)."""
         self._t2_nifti_te_frame.setVisible(idx == 1)
         if hasattr(self, "_t2_sched_frame"):
-            self._t2_sched_frame.setVisible(idx == 1)
+            self._t2_sched_frame.setVisible(idx in (1, 2))
 
     @staticmethod
     def _parse_schedule(text: str):
@@ -1302,23 +1428,31 @@ class T1T2Tab(QWidget):
     # ── Browse slots ──────────────────────────────────────────────────────────
 
     def _browse_t1(self):
-        path = QFileDialog.getExistingDirectory(self, "Select T1 scan folder")
+        if self.combo_t1_fmt.currentIndex() == 2:           # MATLAB (.mat) → file
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select T1 .mat file", "", "MATLAB files (*.mat);;All files (*)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "Select T1 scan folder")
         if path:
             self._t1_dir = path
             self.le_t1_dir.setText(path)
 
     def _browse_t2(self):
-        path = QFileDialog.getExistingDirectory(self, "Select T2 scan folder")
+        if self.combo_t2_fmt.currentIndex() == 2:           # MATLAB (.mat) → file
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select T2 .mat file", "", "MATLAB files (*.mat);;All files (*)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "Select T2 scan folder")
         if path:
             self._t2_dir = path
             self.le_t2_dir.setText(path)
 
     def _on_fa_fixed_toggled(self, checked: bool):
-        """Lock the nominal FA spin box at 60° when Fixed is checked."""
+        """Lock the nominal α spin box at 30° when Fixed is checked."""
         self.spin_fa.setEnabled(not checked)
         if checked:
-            self.spin_fa.setValue(60.0)
-        self.chk_fa_fixed.setText("Fixed (60°)" if checked else "Custom")
+            self.spin_fa.setValue(30.0)
+        self.chk_fa_fixed.setText("Fixed (30°)" if checked else "Custom")
 
     def _browse_b1_fa1(self):
         path = QFileDialog.getExistingDirectory(self, "Select FA\u2081 folder")
@@ -1375,11 +1509,20 @@ class T1T2Tab(QWidget):
             return
         try:
             fmt_idx = self.combo_t1_fmt.currentIndex()
+            _mat_sched_applied = False
             if fmt_idx == 0:
                 # ── Bruker ──────────────────────────────────────────────────
                 from my_gui.bruker_reader import read_2dseq_t1_rarevtr
                 pv360 = self.combo_t1_pv.currentText() == "PV360"
                 self._t1_img, self._t1_trs = read_2dseq_t1_rarevtr(self._t1_dir, pv360=pv360)
+            elif fmt_idx == 2:
+                # ── MATLAB (.mat) — any vendor ───────────────────────────────
+                # The TR/TI vector is auto-detected inside the file; a typed
+                # schedule overrides it (and pins the measurement axis).
+                from my_gui.mat_reader import read_mat_t1_vtr
+                _sched = self._parse_schedule(self.le_t1_sched.text())
+                self._t1_img, self._t1_trs = read_mat_t1_vtr(self._t1_dir, schedule=_sched)
+                _mat_sched_applied = _sched is not None
             elif self._folder_is_nifti(self._t1_dir):
                 # ── GE / Siemens — NIfTI (auto-detected) ────────────────────
                 from my_gui.ge_siemens_reader import read_nifti_t1_vtr
@@ -1399,7 +1542,7 @@ class T1T2Tab(QWidget):
             # (GE/Siemens CEST-MRF: the DICOM TR is constant, so the fit needs the
             # real recovery times).  Applied AFTER reversal so the schedule maps
             # positionally to the displayed image order.
-            sched_applied = False
+            sched_applied = _mat_sched_applied
             if fmt_idx == 1:
                 sched = self._parse_schedule(self.le_t1_sched.text())
                 if sched is not None:
@@ -1433,11 +1576,18 @@ class T1T2Tab(QWidget):
             return
         try:
             fmt_idx = self.combo_t2_fmt.currentIndex()
+            _mat_sched_applied = False
             if fmt_idx == 0:
                 # ── Bruker ──────────────────────────────────────────────────
                 from my_gui.bruker_reader import read_2dseq_t2_msme
                 pv360 = self.combo_t2_pv.currentText() == "PV360"
                 self._t2_img, self._t2_tes = read_2dseq_t2_msme(self._t2_dir, pv360=pv360)
+            elif fmt_idx == 2:
+                # ── MATLAB (.mat) — any vendor ───────────────────────────────
+                from my_gui.mat_reader import read_mat_t2_msme
+                _sched = self._parse_schedule(self.le_t2_sched.text())
+                self._t2_img, self._t2_tes = read_mat_t2_msme(self._t2_dir, schedule=_sched)
+                _mat_sched_applied = _sched is not None
             elif self._folder_is_nifti(self._t2_dir):
                 # ── GE / Siemens — NIfTI (auto-detected) ────────────────────
                 from my_gui.ge_siemens_reader import read_nifti_t2_msme
@@ -1458,7 +1608,7 @@ class T1T2Tab(QWidget):
             # Override the TE x-axis with the user-entered prep-time schedule
             # (GE/Siemens CEST-MRF: the DICOM TE is constant, so the fit needs the
             # real prep / spin-lock times).  Applied AFTER reversal.
-            sched_applied = False
+            sched_applied = _mat_sched_applied
             if fmt_idx == 1:
                 sched = self._parse_schedule(self.le_t2_sched.text())
                 if sched is not None:
@@ -1586,6 +1736,18 @@ class T1T2Tab(QWidget):
         self.chk_roi_bg.setChecked(True)
         self._refresh_display()
 
+    @staticmethod
+    def _frame_label(prefix, vals, idx, n, excluded=False):
+        """Safe slider label.  The image frame count (n) can exceed the TR/TE
+        list on size-mismatched or mislabelled scans, so guard the lookup and
+        fall back to a plain frame index instead of crashing (IndexError)."""
+        arr = np.asarray(vals).ravel() if vals is not None else np.asarray([])
+        if 0 <= idx < arr.size:
+            txt = f"{prefix} = {float(arr[idx]):.0f} ms  ({idx + 1}/{n})"
+        else:
+            txt = f"frame {idx + 1}/{n}"
+        return txt + ("  [EXCLUDED]" if excluded else "")
+
     def _refresh_display(self):
         if hasattr(self, "chk_dark_bg"):
             self.canvas._dark_bg = self.chk_dark_bg.isChecked()
@@ -1609,13 +1771,13 @@ class T1T2Tab(QWidget):
         if is_overlay and "→ T1" in choice and self._t1_img is not None:
             n = self._t1_img.shape[3]
             self._img_slider.setMaximum(max(n - 1, 0))
-            idx = self._img_slider.value()
-            self._img_slider_label.setText(f"TR = {self._t1_trs[idx]:.0f} ms  ({idx + 1}/{n})")
+            idx = min(self._img_slider.value(), max(n - 1, 0))
+            self._img_slider_label.setText(self._frame_label("TR", self._t1_trs, idx, n))
         elif is_overlay and "→ T2" in choice and self._t2_img is not None:
             n = self._t2_img.shape[3]
             self._img_slider.setMaximum(max(n - 1, 0))
-            idx = self._img_slider.value()
-            self._img_slider_label.setText(f"TE = {self._t2_tes[idx]:.0f} ms  ({idx + 1}/{n})")
+            idx = min(self._img_slider.value(), max(n - 1, 0))
+            self._img_slider_label.setText(self._frame_label("TE", self._t2_tes, idx, n))
 
         # Exclude checkbox only applies to T1/T2 image views
         _is_t1t2_img = choice in ("T1 Images", "T2 Images")
@@ -1624,24 +1786,20 @@ class T1T2Tab(QWidget):
         if choice == "T1 Images" and self._t1_img is not None:
             n = self._t1_img.shape[3]
             self._img_slider.setMaximum(max(n - 1, 0))
-            idx = self._img_slider.value()
+            idx = min(self._img_slider.value(), max(n - 1, 0))
             _exc = idx in self._t1_excluded
             self._img_slider_label.setText(
-                f"TR = {self._t1_trs[idx]:.0f} ms  ({idx + 1}/{n})"
-                + ("  [EXCLUDED]" if _exc else "")
-            )
+                self._frame_label("TR", self._t1_trs, idx, n, _exc))
             self.chk_exclude_img.blockSignals(True)
             self.chk_exclude_img.setChecked(_exc)
             self.chk_exclude_img.blockSignals(False)
         elif choice == "T2 Images" and self._t2_img is not None:
             n = self._t2_img.shape[3]
             self._img_slider.setMaximum(max(n - 1, 0))
-            idx = self._img_slider.value()
+            idx = min(self._img_slider.value(), max(n - 1, 0))
             _exc = idx in self._t2_excluded
             self._img_slider_label.setText(
-                f"TE = {self._t2_tes[idx]:.0f} ms  ({idx + 1}/{n})"
-                + ("  [EXCLUDED]" if _exc else "")
-            )
+                self._frame_label("TE", self._t2_tes, idx, n, _exc))
             self.chk_exclude_img.blockSignals(True)
             self.chk_exclude_img.setChecked(_exc)
             self.chk_exclude_img.blockSignals(False)
@@ -1660,7 +1818,6 @@ class T1T2Tab(QWidget):
             (r for r in getattr(self, '_last_rois', []) if r.name == "Phantom_outline"),
             None,
         )
-
         def _rescale_mask(m: np.ndarray, shape) -> "np.ndarray | None":
             m = np.asarray(m)
             if m.shape[:2] == shape[:2]:
@@ -1705,17 +1862,25 @@ class T1T2Tab(QWidget):
             self._show_reference()
         elif choice == "T1 Images":
             if self._t1_img is not None:
-                tr_idx = self._img_slider.value()
+                n_tr = self._t1_img.shape[3]
+                tr_idx = min(max(self._img_slider.value(), 0), n_tr - 1)
                 img = self._t1_img[:, :, self._slice_idx, tr_idx]
-                title = _ctitle or f"T1 Image \u2014 TR = {self._t1_trs[tr_idx]:.0f} ms"
+                _trs = np.asarray(self._t1_trs).ravel()
+                _lbl = (f"TR = {float(_trs[tr_idx]):.0f} ms" if tr_idx < _trs.size
+                        else f"frame {tr_idx + 1}/{n_tr}")
+                title = _ctitle or f"T1 Image \u2014 {_lbl}"
                 self.canvas.show_map(_mask(img), title,
                                      cmap=cmap, vmin=vmin, vmax=vmax, **fs)
                 self.canvas._img_data = img
         elif choice == "T2 Images":
             if self._t2_img is not None:
-                te_idx = self._img_slider.value()
+                n_te = self._t2_img.shape[3]
+                te_idx = min(max(self._img_slider.value(), 0), n_te - 1)
                 img = self._t2_img[:, :, self._slice_idx, te_idx]
-                title = _ctitle or f"T2 Image \u2014 TE = {self._t2_tes[te_idx]:.0f} ms"
+                _tes = np.asarray(self._t2_tes).ravel()
+                _lbl = (f"TE = {float(_tes[te_idx]):.0f} ms" if te_idx < _tes.size
+                        else f"frame {te_idx + 1}/{n_te}")
+                title = _ctitle or f"T2 Image \u2014 {_lbl}"
                 self.canvas.show_map(_mask(img), title,
                                      cmap=cmap, vmin=vmin, vmax=vmax, **fs)
                 self.canvas._img_data = img
@@ -1736,19 +1901,23 @@ class T1T2Tab(QWidget):
                         return
                 roi_only = (getattr(self, "chk_roi_only", None) is not None
                             and self.chk_roi_only.isChecked())
-                if roi_only and self._t1_img is not None:
-                    # Overlay ROI-restricted T1 map on the last-TR image
-                    base = self._t1_img[:, :, self._slice_idx, -1]
-                    ov_cmap = cmap if cmap not in ("gray", "Greys") else "jet"
-                    self.canvas.show_overlay(
-                        base, _mask(self._t1_map),
-                        _ctitle or f"T1 map (ms) on last-TR image "
-                                   f"({self._t1_trs[-1]:.0f} ms)",
-                        base_cmap="gray", overlay_cmap=ov_cmap, alpha=0.9,
-                        vmin=vmin, vmax=vmax, **fs)
-                else:
-                    self.canvas.show_map(_mask(self._t1_map), _ctitle or "T1 map (ms)",
-                                         cmap=cmap, vmin=vmin, vmax=vmax, **fs)
+                if roi_only:
+                    # ROIs only: colored map inside every ROI + any outline drawn,
+                    # over the chosen Bkg image (fallback: last-TR frame).
+                    _base = (self._roi_bg_img
+                             if getattr(self, "_roi_bg_img", None) is not None
+                             else (self._t1_img[:, :, self._slice_idx, -1]
+                                   if self._t1_img is not None else None))
+                    _union_all = roi_union_mask(getattr(self, "_last_rois", []),
+                                                self._t1_map.shape, exclude=())
+                    if _base is not None and _union_all is not None:
+                        _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
+                        self.canvas.show_map_over_raw(
+                            self._t1_map, _base, _union_all, _ctitle or "T1 map (ms)",
+                            cmap=_ovc, vmin=vmin, vmax=vmax, **fs)
+                        return
+                self.canvas.show_map(_mask(self._t1_map), _ctitle or "T1 map (ms)",
+                                     cmap=cmap, vmin=vmin, vmax=vmax, **fs)
         elif choice == "T2 Map (ms)":
             if self._t2_map is not None:
                 if getattr(self, "chk_roi_bg", None) is not None and self.chk_roi_bg.isChecked():
@@ -1766,19 +1935,23 @@ class T1T2Tab(QWidget):
                         return
                 roi_only = (getattr(self, "chk_roi_only", None) is not None
                             and self.chk_roi_only.isChecked())
-                if roi_only and self._t2_img is not None:
-                    # Overlay ROI-restricted T2 map on the last-TE image
-                    base = self._t2_img[:, :, self._slice_idx, -1]
-                    ov_cmap = cmap if cmap not in ("gray", "Greys") else "jet"
-                    self.canvas.show_overlay(
-                        base, _mask(self._t2_map),
-                        _ctitle or f"T2 map (ms) on last-TE image "
-                                   f"({self._t2_tes[-1]:.0f} ms)",
-                        base_cmap="gray", overlay_cmap=ov_cmap, alpha=0.9,
-                        vmin=vmin, vmax=vmax, **fs)
-                else:
-                    self.canvas.show_map(_mask(self._t2_map), _ctitle or "T2 map (ms)",
-                                         cmap=cmap, vmin=vmin, vmax=vmax, **fs)
+                if roi_only:
+                    # ROIs only: colored map inside every ROI + any outline drawn,
+                    # over the chosen Bkg image (fallback: last-TE frame).
+                    _base = (self._roi_bg_img
+                             if getattr(self, "_roi_bg_img", None) is not None
+                             else (self._t2_img[:, :, self._slice_idx, -1]
+                                   if self._t2_img is not None else None))
+                    _union_all = roi_union_mask(getattr(self, "_last_rois", []),
+                                                self._t2_map.shape, exclude=())
+                    if _base is not None and _union_all is not None:
+                        _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
+                        self.canvas.show_map_over_raw(
+                            self._t2_map, _base, _union_all, _ctitle or "T2 map (ms)",
+                            cmap=_ovc, vmin=vmin, vmax=vmax, **fs)
+                        return
+                self.canvas.show_map(_mask(self._t2_map), _ctitle or "T2 map (ms)",
+                                     cmap=cmap, vmin=vmin, vmax=vmax, **fs)
         elif choice == "α₁ Images (B1 FA1)":
             if self._b1_fa1_img is not None:
                 imgs = self._b1_fa1_img
@@ -1821,6 +1994,24 @@ class T1T2Tab(QWidget):
                             self._b1_map, _base, _union, _ctitle or "B1 map",
                             cmap=_ovc, vmin=vmin, vmax=vmax, **fs)
                         return
+                roi_only = (getattr(self, "chk_roi_only", None) is not None
+                            and self.chk_roi_only.isChecked())
+                if roi_only:
+                    _raw = self._b1_fa1_img
+                    _base = None
+                    if getattr(self, "_roi_bg_img", None) is not None:
+                        _base = self._roi_bg_img
+                    elif _raw is not None:
+                        _base = (_raw[:, :, self._slice_idx, 0] if _raw.ndim == 4
+                                 else _raw[:, :, 0] if _raw.ndim == 3 else None)
+                    _union_all = roi_union_mask(getattr(self, "_last_rois", []),
+                                                self._b1_map.shape, exclude=())
+                    if _base is not None and _union_all is not None:
+                        _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
+                        self.canvas.show_map_over_raw(
+                            self._b1_map, _base, _union_all, _ctitle or "B1 map",
+                            cmap=_ovc, vmin=vmin, vmax=vmax, **fs)
+                        return
                 self.canvas.show_map(_mask(self._b1_map), _ctitle or "B1 map",
                                      cmap=cmap, vmin=vmin, vmax=vmax, **fs)
         elif choice == "ΔB0 Map (ppm)":
@@ -1848,6 +2039,31 @@ class T1T2Tab(QWidget):
                         _ovc = _dcmap if str(_dcmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
                             db0, _base, _union, _ctitle or "ΔB0 map (ppm)  [WASABI]",
+                            cmap=_ovc, vmin=_vmin, vmax=_vmax, **fs)
+                        return
+                roi_only = (getattr(self, "chk_roi_only", None) is not None
+                            and self.chk_roi_only.isChecked())
+                if roi_only:
+                    _raw = self._b1_fa1_img
+                    _base = None
+                    if getattr(self, "_roi_bg_img", None) is not None:
+                        _base = self._roi_bg_img
+                    elif _raw is not None:
+                        _base = (_raw[:, :, self._slice_idx, 0] if _raw.ndim == 4
+                                 else _raw[:, :, 0] if _raw.ndim == 3 else None)
+                    _union_all = roi_union_mask(getattr(self, "_last_rois", []),
+                                                db0.shape, exclude=())
+                    if _base is not None and _union_all is not None:
+                        _vmin, _vmax = vmin, vmax
+                        if _vmin is None and _vmax is None:
+                            _sel = db0[_union_all] if db0.shape[:2] == _union_all.shape[:2] else db0
+                            _fin = np.asarray(_sel)[np.isfinite(_sel)]
+                            _lim = float(np.nanpercentile(np.abs(_fin), 99)) if _fin.size else 1.0
+                            _vmin, _vmax = -_lim, _lim
+                        _dcmap = cmap if cmap != "viridis" else "bwr"
+                        _ovc = _dcmap if str(_dcmap).lower() not in ("gray", "greys", "greys_r") else "jet"
+                        self.canvas.show_map_over_raw(
+                            db0, _base, _union_all, _ctitle or "ΔB0 map (ppm)  [WASABI]",
                             cmap=_ovc, vmin=_vmin, vmax=_vmax, **fs)
                         return
                 mm = _mask(db0)
@@ -2042,12 +2258,23 @@ class T1T2Tab(QWidget):
     # Fitting / calculation slots
     # ------------------------------------------------------------------
 
+    def _t12_use_offset(self) -> bool:
+        """Whether the T1/T2 fits include the constant +C offset (noise floor).
+        Toggled from the ROI Spectra dialog; applies to the map fits too."""
+        return bool(getattr(self, "_t12_offset_on", True))
+
     def _run_t1_fit(self):
         if self._t1_img is None or self._t1_trs is None:
             self.lbl_proc_status.setText("Load T1 data first.")
             return
         sl = self._slice_idx
         nTR = self._t1_img.shape[3]
+        _trs_all = np.asarray(self._t1_trs).ravel()
+        if _trs_all.size != nTR:
+            self.lbl_proc_status.setText(
+                f"T1 data mismatch: {nTR} images but {_trs_all.size} TR value(s). "
+                f"Check the loaded scan (wrong or size-mismatched 2dseq).")
+            return
         keep = [i for i in range(nTR) if i not in self._t1_excluded]
         if len(keep) < 3:
             self.lbl_proc_status.setText(
@@ -2058,9 +2285,14 @@ class T1T2Tab(QWidget):
                 f"T1 fit using {len(keep)}/{nTR} TR images "
                 f"(excluded: {sorted(self._t1_excluded)}).")
         img_sl = self._t1_img[:, :, sl, :][:, :, keep]  # (Y, X, nKeep)
-        trs    = self._t1_trs[keep]
+        trs    = _trs_all[keep]
+        _t1_method = ("ir" if getattr(self, "combo_t1_model", None) is not None
+                      and self.combo_t1_model.currentText().startswith("Inversion")
+                      else "vtr")
         self._worker = T1FitWorker(img_sl, trs,
-                                   bruker=(self.combo_t1_fmt.currentIndex() == 0))
+                                   bruker=(self.combo_t1_fmt.currentIndex() == 0),
+                                   use_offset=self._t12_use_offset(),
+                                   method=_t1_method)
         self._worker.finished.connect(self._on_t1_done)
         self._worker.progress.connect(self._on_progress)
         self._worker.error.connect(self._on_worker_error)
@@ -2076,6 +2308,12 @@ class T1T2Tab(QWidget):
             return
         sl = self._slice_idx
         nTE = self._t2_img.shape[3]
+        _tes_all = np.asarray(self._t2_tes).ravel()
+        if _tes_all.size != nTE:
+            self.lbl_proc_status.setText(
+                f"T2 data mismatch: {nTE} images but {_tes_all.size} TE value(s). "
+                f"Check the loaded scan (wrong or size-mismatched 2dseq).")
+            return
         keep = [i for i in range(nTE) if i not in self._t2_excluded]
         if len(keep) < 3:
             self.lbl_proc_status.setText(
@@ -2086,9 +2324,10 @@ class T1T2Tab(QWidget):
                 f"T2 fit using {len(keep)}/{nTE} TE images "
                 f"(excluded: {sorted(self._t2_excluded)}).")
         img_sl = self._t2_img[:, :, sl, :][:, :, keep]  # (Y, X, nKeep)
-        tes    = self._t2_tes[keep]
+        tes    = _tes_all[keep]
         self._worker = T2FitWorker(img_sl, tes,
-                                   bruker=(self.combo_t2_fmt.currentIndex() == 0))
+                                   bruker=(self.combo_t2_fmt.currentIndex() == 0),
+                                   use_offset=self._t12_use_offset())
         self._worker.finished.connect(self._on_t2_done)
         self._worker.progress.connect(self._on_progress)
         self._worker.error.connect(self._on_worker_error)
@@ -2112,9 +2351,11 @@ class T1T2Tab(QWidget):
                 else:
                     fa1_sl = self._b1_fa1_img[:, :]
                     fa2_sl = self._b1_fa2_img[:, :]
-                self._b1_map = calc_b1_ratio(fa1_sl, fa2_sl)
+                self._b1_map = calc_b1_map(fa1_sl, fa2_sl, self.spin_fa.value())
+                _in = self._b1_map[np.isfinite(self._b1_map)]
                 self.lbl_proc_status.setText(
-                    "B1 map calculated (double-angle, S₂α/2S₁ = cos α).")
+                    f"B1 map (%) calculated (double-angle, nominal α={self.spin_fa.value():g}°)"
+                    + (f" — mean {np.nanmean(_in):.0f}%." if _in.size else "."))
             elif m.startswith("Pre-computed"):
                 if self._b1_pre_img is None:
                     self.lbl_proc_status.setText("Load a B1 map first.")
@@ -2586,6 +2827,17 @@ class T1T2Tab(QWidget):
         chk_dark_bg.setToolTip("Black background for the figure (for slides). Only the white surround and labels flip - the maps stay identical.")
         ctrl.addWidget(chk_dark_bg)
 
+        # +C (noise-floor) offset in the T1/T2 fit equations.  Shared state with
+        # the map fits (self._t12_offset_on); toggling re-fits the ROI curves.
+        chk_offset = QCheckBox("+C offset (noise floor)")
+        chk_offset.setChecked(self._t12_use_offset())
+
+        def _on_offset_toggle(on):
+            self._t12_offset_on = bool(on)
+            _sched_font()
+        chk_offset.toggled.connect(_on_offset_toggle)
+        ctrl.addWidget(chk_offset)
+
         # ── Custom single colour for every ROI curve (instead of random) ──────
         _color_override = [None]
         _picked = ["#1f77b4"]
@@ -2636,28 +2888,31 @@ class T1T2Tab(QWidget):
             uses the actual fitted M0/c. rois_subset is the page of ROIs to plot.
             """
             fit_fn = _fit_t1 if kind == "t1" else _fit_t2
+            _is_ir = (kind == "t1"
+                      and getattr(self, "combo_t1_model", None) is not None
+                      and self.combo_t1_model.currentText().startswith("Inversion"))
 
             def _fit_and_curve(sig):
-                """Return (val_ms, curve_y, warn_str) for one mean spectrum."""
-                if bruker:
-                    val = fit_fn(sig, x_vals, bruker=True)        # original bounds
-                    if val <= 0:
+                """Return (val_ms, curve_y, warn_str) for one mean spectrum.
+                Uses the actual fitted amplitude/offset (incl. the optional +C)."""
+                _uo = self._t12_use_offset()
+                if _is_ir:
+                    aMag, T1, bMag, _idx = _fit_t1_ir(sig, x_vals, full=True, use_offset=_uo)
+                    if T1 <= 0:
                         return 0.0, None, ""
-                    if kind == "t1":
-                        M0 = float(sig.max() - sig.min()); c = float(sig.min())
-                        curve = M0 * (1.0 - np.exp(-x_fine / val)) + c   # original model
-                    else:
-                        curve = float(sig.max()) * np.exp(-x_fine / val)  # original model
-                    return val, curve, ""
-                # GE/Siemens — use the actual fitted amplitude/offset
-                params = fit_fn(sig, x_vals, full=True, bruker=False)
+                    # IR magnitude model: |a + b·e^−TI/T1| with a>0, b<0 → |aMag − bMag·e|
+                    curve = np.abs(aMag - bMag * np.exp(-x_fine / T1))
+                    return T1, curve, ""
+                params = fit_fn(sig, x_vals, full=True, bruker=bruker, use_offset=_uo)
                 val = params[1]
                 if val <= 0:
                     return 0.0, None, ""
                 if kind == "t1":
-                    M0, T1, c = params; curve = M0 * (1.0 - np.exp(-x_fine / T1)) + c
+                    M0, T1, c = params
+                    curve = M0 * (1.0 - np.exp(-x_fine / T1)) + c
                 else:
-                    M0, T2 = params; curve = M0 * np.exp(-x_fine / T2)
+                    M0, T2, C = params
+                    curve = M0 * np.exp(-x_fine / T2) + C
                 return val, curve, ""      # no extrapolation warning text
 
             H, W, nX = img_sl.shape

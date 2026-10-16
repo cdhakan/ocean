@@ -28,9 +28,9 @@ class ROIManager(QObject):
 
     # ROIs whose names mark them as the *global analysis mask* — every module
     # (T1/T2/B1, CEST MRI, CEST MRF, QUESP) restricts its output maps to their
-    # union.  "Brain_outline" comes from Detect Brain Outline, "Phantom_outline"
-    # from Detect Outline.
-    MASK_ROI_NAMES = ("Brain_outline", "Phantom_outline")
+    # union.  "Brain_outline" comes from Detect Brain Outline, "Mouse_Brain_outline"
+    # from Detect Mice Brain Outline, "Phantom_outline" from Detect Outline.
+    MASK_ROI_NAMES = ("Brain_outline", "Mouse_Brain_outline", "Phantom_outline")
 
     def __init__(self):
         super().__init__()

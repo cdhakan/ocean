@@ -438,6 +438,20 @@ class MainWindow(QMainWindow):
                 self.zspec_tab.spin_cest_mrd_mhz.setValue(
                     self.scan_dir_tab.get_mrd_larmor_mhz())
                 self.zspec_tab._load_cest()   # auto-load immediately
+            elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix"
+                  and hasattr(self.zspec_tab, 'edit_cest_twix')):
+                # Siemens TWIX (.dat) — raw k-space reconstructed by OCEAN
+                self.zspec_tab.combo_vendor_cest.setCurrentText("Siemens TWIX (.dat)")
+                self.zspec_tab._cest_twix_path = path
+                self.zspec_tab.edit_cest_twix.setText(path)
+                self.zspec_tab._load_cest()   # auto-load (ppm needs offsets .seq/.txt)
+            elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "mat"
+                  and hasattr(self.zspec_tab, 'edit_cest_mat')):
+                # MATLAB (.mat) — vendor-neutral single-file Z-stack
+                self.zspec_tab.combo_vendor_cest.setCurrentText("MATLAB (.mat)")
+                self.zspec_tab._cest_mat_path = path
+                self.zspec_tab.edit_cest_mat.setText(path)
+                self.zspec_tab._load_cest()   # auto-load immediately
             elif vendor == "ge_siemens" and hasattr(self.zspec_tab, 'edit_cest_data'):
                 self.zspec_tab.combo_vendor_cest.setCurrentText("GE/Siemens")
                 self.zspec_tab._cest_data_path = path
@@ -457,6 +471,18 @@ class MainWindow(QMainWindow):
                 self.zspec_tab.edit_wassr_mrd_path.setText(path)
                 self.zspec_tab.spin_wassr_mrd_mhz.setValue(
                     self.scan_dir_tab.get_mrd_larmor_mhz())
+                self.zspec_tab._load_wassr()   # auto-load immediately
+            elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix"
+                  and hasattr(self.zspec_tab, 'edit_wassr_twix')):
+                self.zspec_tab.combo_vendor_wassr.setCurrentText("Siemens TWIX (.dat)")
+                self.zspec_tab._wassr_twix_path = path
+                self.zspec_tab.edit_wassr_twix.setText(path)
+                self.zspec_tab._load_wassr()   # auto-load (ppm needs offsets .seq/.txt)
+            elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "mat"
+                  and hasattr(self.zspec_tab, 'edit_wassr_mat')):
+                self.zspec_tab.combo_vendor_wassr.setCurrentText("MATLAB (.mat)")
+                self.zspec_tab._wassr_mat_path = path
+                self.zspec_tab.edit_wassr_mat.setText(path)
                 self.zspec_tab._load_wassr()   # auto-load immediately
             elif vendor == "ge_siemens" and hasattr(self.zspec_tab, 'edit_wassr_data'):
                 self.zspec_tab.combo_vendor_wassr.setCurrentText("GE/Siemens")
@@ -487,15 +513,21 @@ class MainWindow(QMainWindow):
                 self.quesp_tab.load_from_path(path, pv360=pv360)
 
         elif key == "t1":
+            if vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix":
+                self.statusBar().showMessage(
+                    "Siemens TWIX (.dat) is supported for CEST / WASSR only — "
+                    "T1 needs DICOM, NIfTI or .mat", 6000)
+                return
             if hasattr(self.t1t2_tab, 'le_t1_dir'):
                 self.t1t2_tab._t1_dir = path
                 self.t1t2_tab.le_t1_dir.setText(path)
                 # Set scanner format before loading so the correct reader is used:
-                # index 0 = Bruker (2dseq), 1 = GE/Siemens DICOM, 2 = GE/Siemens NIfTI
+                # index 0 = Bruker (2dseq), 1 = GE/Siemens (DICOM or NIfTI — the
+                # tab auto-detects which), 2 = MATLAB (.mat, any vendor)
                 vendor = self.scan_dir_tab.get_vendor()
                 if vendor == 'ge_siemens' and hasattr(self.t1t2_tab, 'combo_t1_fmt'):
                     gs_fmt = self.scan_dir_tab.get_gs_format()
-                    fmt_idx = 1 if gs_fmt == 'dicom' else 2
+                    fmt_idx = 2 if gs_fmt == 'mat' else 1
                     self.t1t2_tab.combo_t1_fmt.setCurrentIndex(fmt_idx)
                 elif hasattr(self.t1t2_tab, 'combo_t1_fmt'):
                     self.t1t2_tab.combo_t1_fmt.setCurrentIndex(0)
@@ -505,13 +537,18 @@ class MainWindow(QMainWindow):
                 self.t1t2_tab._load_t1()
 
         elif key == "t2":
+            if vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix":
+                self.statusBar().showMessage(
+                    "Siemens TWIX (.dat) is supported for CEST / WASSR only — "
+                    "T2 needs DICOM, NIfTI or .mat", 6000)
+                return
             if hasattr(self.t1t2_tab, 'le_t2_dir'):
                 self.t1t2_tab._t2_dir = path
                 self.t1t2_tab.le_t2_dir.setText(path)
                 vendor = self.scan_dir_tab.get_vendor()
                 if vendor == 'ge_siemens' and hasattr(self.t1t2_tab, 'combo_t2_fmt'):
                     gs_fmt = self.scan_dir_tab.get_gs_format()
-                    fmt_idx = 1 if gs_fmt == 'dicom' else 2
+                    fmt_idx = 2 if gs_fmt == 'mat' else 1
                     self.t1t2_tab.combo_t2_fmt.setCurrentIndex(fmt_idx)
                 elif hasattr(self.t1t2_tab, 'combo_t2_fmt'):
                     self.t1t2_tab.combo_t2_fmt.setCurrentIndex(0)

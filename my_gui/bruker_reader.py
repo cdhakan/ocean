@@ -201,6 +201,7 @@ def _read_reco_params(scan_dir: Path) -> dict[str, str | None]:
         "RECO_size":       None,
         "RECO_wordtype":   None,
         "RECO_byte_order": None,
+        "RECO_map_slope":  None,
     }
     try:
         with open(reco_path, "r", errors="replace") as fh:
@@ -212,6 +213,7 @@ def _read_reco_params(scan_dir: Path) -> dict[str, str | None]:
         "##$RECO_size":       "RECO_size",
         "##$RECO_wordtype":   "RECO_wordtype",
         "##$RECO_byte_order": "RECO_byte_order",
+        "##$RECO_map_slope":  "RECO_map_slope",
     }
     for key, out_key in targets.items():
         for i, line in enumerate(lines):
@@ -554,6 +556,23 @@ def load_scan_first_frame(scan_dir, pv360: bool = False):
     return None
 
 
+def load_scan_stack(scan_dir, pv360: bool = False):
+    """Return (stack, nsl, nit) for the Bkg picker so a specific slice/frame can
+    be chosen.  ``stack`` is (Y, X, nsl, nit) float oriented like the app's maps,
+    or (None, 0, 0) if unreadable.  Accepts a scan-number dir or a pdata/1 dir."""
+    base = Path(scan_dir)
+    for d in (base, base / "pdata" / "1"):
+        if (d / "2dseq").exists():
+            try:
+                nx, ny, nsl, nit = _read_geometry(d)
+                raw = np.asarray(_read_raw(d, nx, ny, nsl, nit), dtype=float)
+                stack = np.transpose(raw, (1, 0, 2, 3))   # (nx,ny,..)->display (Y,X,..)
+                return stack, int(stack.shape[2]), int(stack.shape[3])
+            except Exception:
+                return None, 0, 0
+    return None, 0, 0
+
+
 def read_2dseq_mrf(scan_dir: str | Path, pv360: bool = False) -> tuple[np.ndarray, dict, dict]:
     """
     Read Bruker 2dseq MRF data and extract sequence parameters.
@@ -664,14 +683,32 @@ def read_2dseq_cest(scan_dir: str | Path, pv360: bool = False) -> tuple[np.ndarr
     omega_0_arr = _parse_numbers(satpars.get(frq_key))
     omega_0 = float(omega_0_arr[0]) if len(omega_0_arr) > 0 else 297.0
 
-    # ── Trim / pad w_offset to niter ─────────────────────────────────────
+    # ── Reconcile offset-list length with the number of acquired frames ──
+    m0_forced_idx = None
     if len(w_offset) == 0:
         warnings.warn(
             f"CEST: no saturation offset key found in method file of {scan_dir}. "
             f"Tried: {[fc[0] for fc in freq_candidates]}. Using zeros."
         )
         w_offset = np.zeros(niter)
-    if len(w_offset) != niter:
+    elif len(w_offset) == niter - 1:
+        # One MORE frame than offsets: an extra UNSATURATED M0 reference frame.
+        # Common in Bruker PV360 EPI-CEST — the saturation offset list (e.g.
+        # PVM_SatTransFreqValues) covers only the ±N ppm sweep and there is NO
+        # far-offset ±100 ppm entry; the reference is an unsaturated frame
+        # (usually the first, and always the highest-signal one).  Detect it and
+        # slot a far-offset sentinel in at its position so the standard M0
+        # removal / normalisation below treats it as the reference.
+        frame_sig = np.asarray(rawdata, dtype=float).reshape(-1, niter).mean(axis=0)
+        m0_forced_idx = int(np.argmax(frame_sig))
+        sentinel = float(np.nanmax(np.abs(w_offset))) + 100.0
+        full = np.empty(niter, dtype=np.float64)
+        other = np.ones(niter, dtype=bool)
+        other[m0_forced_idx] = False
+        full[m0_forced_idx] = sentinel
+        full[other] = w_offset       # real offsets fill the remaining frames in order
+        w_offset = full
+    elif len(w_offset) != niter:
         warnings.warn(
             f"CEST: offset array length ({len(w_offset)}) != niter ({niter}). "
             f"Trimming/padding.  Key used: {freq_key_used!r}"
@@ -704,14 +741,16 @@ def read_2dseq_cest(scan_dir: str | Path, pv360: bool = False) -> tuple[np.ndarr
     # acquisition is used as a proxy M0 for normalisation, but it is KEPT in
     # the analysis subset so all acquired offsets are available for B0 fitting.
     abs_ppm = np.abs(w_offset_ppm_raw)
-    m0_idx = int(np.argmax(abs_ppm))   # frame at largest |ppm| — always the best proxy
-
-    if abs_ppm.max() > 50.0:
-        # True CEST: explicit far-off-resonance M0 (e.g. 100 ppm)
+    if m0_forced_idx is not None:
+        # Extra unsaturated M0 frame detected above (N+1 frame layout): use it
+        # as the reference regardless of its (sentinel) ppm magnitude.
+        m0_idx = m0_forced_idx
         has_m0 = True
     else:
-        # WASSR / no explicit M0: keep ALL frames in analysis subset
-        has_m0 = False
+        m0_idx = int(np.argmax(abs_ppm))   # frame at largest |ppm| — best proxy
+        # True CEST has an explicit far-off-resonance M0 (e.g. ±100 ppm); a small
+        # range (≤ ±50 ppm) with no extra frame is WASSR-like and keeps all frames.
+        has_m0 = abs_ppm.max() > 50.0
 
     # Use .copy() so M0image is independent of img_all.
     # Without this, M0image is a view; storing img_all as _z_img_all in the
@@ -1243,4 +1282,17 @@ def read_2dseq_b1_rare(scan_dir: str | Path, pv360: bool = False) -> np.ndarray:
 
     rawdata = _read_raw(scan_dir, nx, ny, nslices, 1)
     image = np.transpose(rawdata[:, :, :, 0], (1, 0, 2)).astype(np.float32)
+    # Apply RECO_map_slope so intensities are on a common physical scale.  The two
+    # flip-angle B1 scans are reconstructed INDEPENDENTLY with DIFFERENT slopes, so
+    # the double-angle ratio S_2α/(2·S_α) is wrong without this (matches read2dseq.m:
+    # scaled = raw / RECO_map_slope).  Within a single scan the slope cancels, but
+    # across the α / 2α scans it does not.
+    try:
+        slope = _parse_numbers(_reco_p.get("RECO_map_slope"))
+        if slope.size:
+            s = float(slope.flat[0])
+            if s != 0 and np.isfinite(s):
+                image = image / s
+    except Exception:
+        pass
     return image

@@ -41,6 +41,39 @@ from my_gui.theme import dc
 # Module-level helpers for multi-vendor loading
 # ─────────────────────────────────────────────────────────────────────────────
 
+def parse_seq_definitions(path: str) -> dict:
+    """Parse the ``[DEFINITIONS]`` block of a Pulseq ``.seq`` file.
+
+    Returns a dict mapping each definition to a scalar float (single value) or a
+    list (multiple values), e.g. ``offsets_ppm`` -> [list], ``B1pa`` -> 3.7,
+    ``B0`` -> 9.4, ``FREQ`` -> 400.218.  Non-numeric values (e.g. seq_id_string)
+    are kept as strings.
+    """
+    defs: dict = {}
+    in_def = False
+    with open(path, "r", errors="replace") as fh:
+        for line in fh:
+            s = line.strip()
+            if not in_def:
+                if s.startswith("[DEFINITIONS]"):
+                    in_def = True
+                continue
+            if s.startswith("["):          # next section → stop
+                break
+            if not s:
+                continue
+            parts = s.split()
+            key, raw = parts[0], parts[1:]
+            vals = []
+            for v in raw:
+                try:
+                    vals.append(float(v))
+                except ValueError:
+                    vals.append(v)
+            defs[key] = vals[0] if len(vals) == 1 else vals
+    return defs
+
+
 def _load_dicom_4d(folder: str, ppm_sidecar: str, log_fn) -> tuple:
     """
     Read a DICOM folder and return (img_4d, ppm_array).
@@ -441,6 +474,16 @@ class ZSpecTab(QWidget):
         self._wassr_data_path: str = ""
         self._cest_ppm_path: str = ""          # CEST offsets .txt
         self._wassr_ppm_path: str = ""         # WASSR offsets .txt
+        # MATLAB (.mat) single-file stacks (vendor-neutral) + optional ppm .txt
+        self._cest_mat_path: str = ""
+        self._wassr_mat_path: str = ""
+        self._cest_mat_ppm_path: str = ""
+        self._wassr_mat_ppm_path: str = ""
+        # Siemens TWIX (.dat) raw files + their offsets source (.seq or .txt)
+        self._cest_twix_path: str = ""
+        self._wassr_twix_path: str = ""
+        self._cest_twix_ppm_path: str = ""
+        self._wassr_twix_ppm_path: str = ""
         # Legacy aliases (kept so any stray reference doesn't crash)
         self._cest_dicom_dir = self._cest_nifti_path = ""
         self._wassr_dicom_dir = self._wassr_nifti_path = ""
@@ -476,7 +519,8 @@ class ZSpecTab(QWidget):
         vendor_cest_row.addWidget(QLabel("Platform:"))
         self.combo_vendor_cest = QComboBox()
         self.combo_vendor_cest.addItems(
-            ["Bruker", "GE/Siemens", "MR Solutions"]
+            ["Bruker", "GE/Siemens", "MR Solutions", "MATLAB (.mat)",
+             "Siemens TWIX (.dat)"]
         )
         vendor_cest_row.addWidget(self.combo_vendor_cest, stretch=1)
         g1.addLayout(vendor_cest_row)
@@ -522,6 +566,61 @@ class ZSpecTab(QWidget):
         ge_cest_lay.addLayout(gd)
         self._cest_ge_w.setVisible(False)
         g1.addWidget(self._cest_ge_w)
+
+        # ── MATLAB (.mat) — vendor-neutral single-file Z-stack ───────────────
+        # One .mat holding the image stack (Y,X,[slices,]offsets) plus its ppm
+        # vector (auto-detected by my_gui.mat_reader; an optional offsets .txt
+        # overrides it).  Works for GE / Siemens / Bruker exports alike.
+        self._cest_mat_w = QWidget()
+        mat_cest_lay = QVBoxLayout(self._cest_mat_w)
+        mat_cest_lay.setContentsMargins(0, 0, 0, 0)
+        mat_cest_lay.setSpacing(3)
+        md = QHBoxLayout()
+        md.addWidget(QLabel("File:"))
+        self.edit_cest_mat = QLineEdit(); self.edit_cest_mat.setReadOnly(True)
+        self.edit_cest_mat.setPlaceholderText(".mat — image stack + ppm vector (any vendor)")
+        md.addWidget(self.edit_cest_mat, stretch=1)
+        _bcm = QPushButton("File…"); _bcm.clicked.connect(self._browse_cest_mat)
+        md.addWidget(_bcm)
+        _bco = QPushButton("Offsets…")
+        _bco.clicked.connect(lambda: self._browse_mat_offsets("cest"))
+        md.addWidget(_bco)
+        mat_cest_lay.addLayout(md)
+        self._cest_mat_w.setVisible(False)
+        g1.addWidget(self._cest_mat_w)
+
+        # ── Siemens TWIX (.dat) — raw k-space, reconstructed by OCEAN ────────
+        # 2-D iFFT + sum-of-squares per offset (my_gui.siemens_twix_reader,
+        # needs the `twixtools` package).  The ppm list is NOT stored in the
+        # .dat: supply the Pulseq .seq used for the scan or an offsets .txt.
+        from PyQt6.QtWidgets import QSpinBox as _QSpinBox
+        self._cest_twix_w = QWidget()
+        twx_cest_lay = QVBoxLayout(self._cest_twix_w)
+        twx_cest_lay.setContentsMargins(0, 0, 0, 0)
+        twx_cest_lay.setSpacing(3)
+        tx1 = QHBoxLayout()
+        tx1.addWidget(QLabel("File:"))
+        self.edit_cest_twix = QLineEdit(); self.edit_cest_twix.setReadOnly(True)
+        self.edit_cest_twix.setPlaceholderText("meas_MID*.dat — Siemens raw (TWIX, VD/VE)")
+        tx1.addWidget(self.edit_cest_twix, stretch=1)
+        _btx = QPushButton("File…"); _btx.clicked.connect(self._browse_cest_twix)
+        tx1.addWidget(_btx)
+        _bto = QPushButton("Offsets (.seq/.txt)…")
+        _bto.clicked.connect(lambda: self._browse_twix_offsets("cest"))
+        tx1.addWidget(_bto)
+        twx_cest_lay.addLayout(tx1)
+        tx2 = QHBoxLayout()
+        tx2.addWidget(QLabel("Slice:"))
+        self.spin_cest_twix_slice = _QSpinBox(); self.spin_cest_twix_slice.setRange(0, 99)
+        tx2.addWidget(self.spin_cest_twix_slice)
+        tx2.addWidget(QLabel("Lines / image:"))
+        self.spin_cest_twix_npe = _QSpinBox(); self.spin_cest_twix_npe.setRange(0, 4096)
+        self.spin_cest_twix_npe.setSpecialValueText("auto")
+        tx2.addWidget(self.spin_cest_twix_npe)
+        tx2.addStretch()
+        twx_cest_lay.addLayout(tx2)
+        self._cest_twix_w.setVisible(False)
+        g1.addWidget(self._cest_twix_w)
 
         # ── MR Solutions (.MRD) — data browse only ─────────────────────────
         self._cest_mrd_w = QWidget()
@@ -572,6 +671,9 @@ class ZSpecTab(QWidget):
         btn_cest_ppm = QPushButton("Browse…")
         btn_cest_ppm.clicked.connect(self._browse_cest_ppm)
         gc3.addWidget(btn_cest_ppm)
+        self.btn_cest_pulseq = QPushButton("Read Pulseq")
+        self.btn_cest_pulseq.clicked.connect(self._read_pulseq_cest)
+        gc3.addWidget(self.btn_cest_pulseq)
         _gep.addLayout(gc3)
         self.chk_cest_combined = QCheckBox(
             "This offset .txt file contains WASSR + CEST together")
@@ -652,7 +754,8 @@ class ZSpecTab(QWidget):
         vendor_wassr_row.addWidget(QLabel("Platform:"))
         self.combo_vendor_wassr = QComboBox()
         self.combo_vendor_wassr.addItems(
-            ["Bruker", "GE/Siemens", "MR Solutions"]
+            ["Bruker", "GE/Siemens", "MR Solutions", "MATLAB (.mat)",
+             "Siemens TWIX (.dat)"]
         )
         vendor_wassr_row.addWidget(self.combo_vendor_wassr, stretch=1)
         g2.addLayout(vendor_wassr_row)
@@ -719,6 +822,55 @@ class ZSpecTab(QWidget):
 
         self._wassr_ge_w.setVisible(False)
         g2.addWidget(self._wassr_ge_w)
+
+        # ── MATLAB (.mat) — vendor-neutral single-file WASSR stack ───────────
+        self._wassr_mat_w = QWidget()
+        mat_wassr_lay = QVBoxLayout(self._wassr_mat_w)
+        mat_wassr_lay.setContentsMargins(0, 0, 0, 0)
+        mat_wassr_lay.setSpacing(3)
+        mw = QHBoxLayout()
+        mw.addWidget(QLabel("File:"))
+        self.edit_wassr_mat = QLineEdit(); self.edit_wassr_mat.setReadOnly(True)
+        self.edit_wassr_mat.setPlaceholderText(".mat — WASSR stack + ppm vector (any vendor)")
+        mw.addWidget(self.edit_wassr_mat, stretch=1)
+        _bwm = QPushButton("File…"); _bwm.clicked.connect(self._browse_wassr_mat)
+        mw.addWidget(_bwm)
+        _bwo = QPushButton("Offsets…")
+        _bwo.clicked.connect(lambda: self._browse_mat_offsets("wassr"))
+        mw.addWidget(_bwo)
+        mat_wassr_lay.addLayout(mw)
+        self._wassr_mat_w.setVisible(False)
+        g2.addWidget(self._wassr_mat_w)
+
+        # ── Siemens TWIX (.dat) — raw WASSR k-space reconstructed by OCEAN ───
+        from PyQt6.QtWidgets import QSpinBox as _QSpinBoxW
+        self._wassr_twix_w = QWidget()
+        twx_wassr_lay = QVBoxLayout(self._wassr_twix_w)
+        twx_wassr_lay.setContentsMargins(0, 0, 0, 0)
+        twx_wassr_lay.setSpacing(3)
+        tw1 = QHBoxLayout()
+        tw1.addWidget(QLabel("File:"))
+        self.edit_wassr_twix = QLineEdit(); self.edit_wassr_twix.setReadOnly(True)
+        self.edit_wassr_twix.setPlaceholderText("meas_MID*.dat — Siemens raw (TWIX, VD/VE)")
+        tw1.addWidget(self.edit_wassr_twix, stretch=1)
+        _bwx = QPushButton("File…"); _bwx.clicked.connect(self._browse_wassr_twix)
+        tw1.addWidget(_bwx)
+        _bwo = QPushButton("Offsets (.seq/.txt)…")
+        _bwo.clicked.connect(lambda: self._browse_twix_offsets("wassr"))
+        tw1.addWidget(_bwo)
+        twx_wassr_lay.addLayout(tw1)
+        tw2 = QHBoxLayout()
+        tw2.addWidget(QLabel("Slice:"))
+        self.spin_wassr_twix_slice = _QSpinBoxW(); self.spin_wassr_twix_slice.setRange(0, 99)
+        tw2.addWidget(self.spin_wassr_twix_slice)
+        tw2.addWidget(QLabel("Lines / image:"))
+        self.spin_wassr_twix_npe = _QSpinBoxW(); self.spin_wassr_twix_npe.setRange(0, 4096)
+        self.spin_wassr_twix_npe.setSpecialValueText("auto")
+        tw2.addWidget(self.spin_wassr_twix_npe)
+        tw2.addStretch()
+        twx_wassr_lay.addLayout(tw2)
+        self._wassr_twix_w.setVisible(False)
+        g2.addWidget(self._wassr_twix_w)
 
         # ── MR Solutions (.MRD) sub-widget ─────────────────────────────────
         self._wassr_mrd_w = QWidget()
@@ -857,7 +1009,10 @@ class ZSpecTab(QWidget):
         try:
             import bm3d as _bm3dlib       # noqa: F401
             _bm3d_ok = True
-        except ImportError:
+        except Exception:
+            # ImportError when the package is absent — or OSError /
+            # PyInstallerImportError when bm4d's C library (libbm4d_*.so)
+            # cannot be loaded in a frozen app.  Either way: just disable BM3D.
             _bm3d_ok = False
         try:
             import numba as _nb           # noqa: F401
@@ -1272,6 +1427,15 @@ class ZSpecTab(QWidget):
         self.combo_display.currentIndexChanged.connect(self._refresh_display)
         ctrl_row.addWidget(self.combo_display, stretch=1)
 
+        # "ROIs only" — colour the map inside every ROI + any outline drawn,
+        # over the chosen Bkg image.
+        self.chk_roi_only = QCheckBox("ROIs only")
+        self.chk_roi_only.setToolTip(
+            "Show the colored map inside the ROIs (and any outline drawn), over "
+            "the chosen Bkg image.")
+        self.chk_roi_only.toggled.connect(self._refresh_display)
+        ctrl_row.addWidget(self.chk_roi_only)
+
         # "ROIs + Bg" display mode — colour the map only inside the drawn ROIs,
         # over the 1st raw acquisition frame as a grayscale background.
         self.chk_roi_bg = QCheckBox("ROIs + Bkg")
@@ -1280,6 +1444,11 @@ class ZSpecTab(QWidget):
             "as a gray background.")
         self.chk_roi_bg.toggled.connect(self._refresh_display)
         ctrl_row.addWidget(self.chk_roi_bg)
+        # Mutually exclusive with ROIs only.
+        self.chk_roi_only.toggled.connect(
+            lambda on: on and self.chk_roi_bg.setChecked(False))
+        self.chk_roi_bg.toggled.connect(
+            lambda on: on and self.chk_roi_only.setChecked(False))
 
         self.btn_roi_bg = QPushButton("Bkg…")
         self.btn_roi_bg.setToolTip(
@@ -1468,6 +1637,10 @@ class ZSpecTab(QWidget):
         self._cest_bruker_w.setVisible(v == "Bruker")
         self._cest_ge_w.setVisible(v.startswith("GE/Siemens"))
         self._cest_mrd_w.setVisible(v.startswith("MR Solutions"))
+        if hasattr(self, "_cest_mat_w"):
+            self._cest_mat_w.setVisible(v.startswith("MATLAB"))
+        if hasattr(self, "_cest_twix_w"):
+            self._cest_twix_w.setVisible(v.startswith("Siemens TWIX"))
         # Mirror the platform choice in the "CEST parameters" dialog sections
         if hasattr(self, "_cest_ge_params_w"):
             self._cest_ge_params_w.setVisible(v.startswith("GE/Siemens"))
@@ -1497,6 +1670,10 @@ class ZSpecTab(QWidget):
         self._wassr_bruker_w.setVisible(v == "Bruker")
         self._wassr_ge_w.setVisible(v.startswith("GE/Siemens"))
         self._wassr_mrd_w.setVisible(v.startswith("MR Solutions"))
+        if hasattr(self, "_wassr_mat_w"):
+            self._wassr_mat_w.setVisible(v.startswith("MATLAB"))
+        if hasattr(self, "_wassr_twix_w"):
+            self._wassr_twix_w.setVisible(v.startswith("Siemens TWIX"))
 
     # ── public accessors ──────────────────────────────────────────────────
 
@@ -1561,6 +1738,81 @@ class ZSpecTab(QWidget):
             self._cest_data_path = p
             self.edit_cest_data.setText(p)
 
+    # ── MATLAB (.mat) browse slots ────────────────────────────────────────────
+
+    def _browse_cest_mat(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select CEST .mat file", "", "MATLAB files (*.mat);;All files (*)")
+        if p:
+            self._cest_mat_path = p
+            self.edit_cest_mat.setText(p)
+            self.lbl_cest_info.setText("File selected — click 'Load CEST Data'.")
+            self.lbl_cest_info.setStyleSheet(f"font-size: 11px; color: {dc('#555','#888888')};")
+
+    def _browse_wassr_mat(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select WASSR .mat file", "", "MATLAB files (*.mat);;All files (*)")
+        if p:
+            self._wassr_mat_path = p
+            self.edit_wassr_mat.setText(p)
+
+    def _browse_mat_offsets(self, which: str):
+        """Optional offsets .txt (ppm, one per line) for a .mat without a ppm vector."""
+        p, _ = QFileDialog.getOpenFileName(
+            self, f"Select {which.upper()} offsets (.txt, ppm)", "",
+            "Text files (*.txt *.csv);;All files (*)")
+        if p:
+            setattr(self, f"_{which}_mat_ppm_path", p)
+            self._log(f"{which.upper()} .mat offsets file: {p}")
+
+    # ── Siemens TWIX (.dat) browse slots ──────────────────────────────────────
+
+    def _browse_cest_twix(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select CEST Siemens raw file", "",
+            "Siemens TWIX (*.dat);;All files (*)")
+        if p:
+            self._cest_twix_path = p
+            self.edit_cest_twix.setText(p)
+            self.lbl_cest_info.setText(
+                "File selected — pick the offsets (.seq/.txt), then 'Load CEST Data'.")
+            self.lbl_cest_info.setStyleSheet(f"font-size: 11px; color: {dc('#555','#888888')};")
+
+    def _browse_wassr_twix(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select WASSR Siemens raw file", "",
+            "Siemens TWIX (*.dat);;All files (*)")
+        if p:
+            self._wassr_twix_path = p
+            self.edit_wassr_twix.setText(p)
+
+    def _browse_twix_offsets(self, which: str):
+        """Offsets for a TWIX scan: a Pulseq .seq (offsets_ppm) or a .txt (ppm per line)."""
+        p, _ = QFileDialog.getOpenFileName(
+            self, f"Select {which.upper()} offsets (.seq or .txt)", "",
+            "Pulseq / text (*.seq *.txt *.csv);;All files (*)")
+        if p:
+            setattr(self, f"_{which}_twix_ppm_path", p)
+            self._log(f"{which.upper()} TWIX offsets source: {p}")
+
+    @staticmethod
+    def _twix_offsets_from(path: str, n_offsets: int, data_path: str, log_fn) -> np.ndarray:
+        """ppm vector for a reconstructed TWIX stack: from a Pulseq .seq
+        ([DEFINITIONS] offsets_ppm, length-checked against the frame count) or
+        from a .txt via the NIfTI sidecar helper (sequential fallback)."""
+        if path and path.lower().endswith(".seq"):
+            from my_gui.tabs.sequence_tab import _parse_seq_definitions
+            offs = _parse_seq_definitions(path).get("offsets_ppm", None)
+            if offs is None:
+                raise ValueError("no 'offsets_ppm' entry in the .seq [DEFINITIONS]")
+            ppm = np.atleast_1d(np.asarray(offs, dtype=float)).ravel()
+            if ppm.size != n_offsets:
+                raise ValueError(f".seq lists {ppm.size} offsets but the .dat "
+                                 f"reconstructed {n_offsets} frames")
+            log_fn(f"  PPM from .seq ({ppm.size} values).")
+            return ppm
+        return _load_ppm_sidecar(path, data_path, n_offsets, log_fn)
+
     def _browse_cest_ppm(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select CEST offsets file", "",
@@ -1569,6 +1821,53 @@ class ZSpecTab(QWidget):
         if path:
             self._cest_ppm_path = path
             self.edit_cest_ppm_path.setText(path)
+
+    def _read_pulseq_cest(self):
+        """Read a Pulseq .seq file: take offsets_ppm as the CEST offsets, and
+        the Larmor frequency (FREQ, else B0·γ) + B1 power (B1pa) from the same
+        [DEFINITIONS] block — like the WASABI sequence definitions."""
+        import os, tempfile
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Pulseq sequence (.seq)", "", "Pulseq (*.seq);;All files (*)")
+        if not path:
+            return
+        try:
+            defs = parse_seq_definitions(path)
+        except Exception as exc:
+            self._log(f"Pulseq read error: {exc}")
+            return
+        offs = defs.get("offsets_ppm")
+        if offs is None:
+            self._log("No 'offsets_ppm' found in the .seq [DEFINITIONS] block.")
+            return
+        offs = np.atleast_1d(np.asarray(offs, dtype=float)).ravel()
+
+        # Larmor (MHz): FREQ if present, else B0 (T) × 42.5764 MHz/T.
+        freq = defs.get("FREQ")
+        if isinstance(freq, (int, float)) and freq > 0:
+            larmor = float(freq)
+        else:
+            b0 = defs.get("B0", 0.0)
+            larmor = float(b0) * 42.5764 if (isinstance(b0, (int, float)) and b0 > 0) \
+                else self.spin_gecest_mhz.value()
+
+        # B1 power (µT): B1pa (fall back to B1rms / B1).
+        b1 = next((defs[k] for k in ("B1pa", "B1rms", "B1") if isinstance(defs.get(k), (int, float))), None)
+
+        # Reuse the existing GE/Siemens offsets pipeline: write offsets in Hz
+        # (= ppm × Larmor) so the loader converts them back with the same Larmor.
+        tmp = os.path.join(tempfile.gettempdir(), "ocean_pulseq_offsets.txt")
+        np.savetxt(tmp, offs * larmor, fmt="%.6f")
+        self._cest_ppm_path = tmp
+        self.edit_cest_ppm_path.setText(
+            f"{os.path.basename(path)}  →  {offs.size} offsets ({offs.min():.2f}…{offs.max():.2f} ppm)")
+        self.chk_gecest_hz.setChecked(True)
+        self.spin_gecest_mhz.setValue(larmor)
+        if b1 is not None and float(b1) > 0:
+            self._cest_satpwr_uT = float(b1)
+        self._log(
+            f"Pulseq '{defs.get('seq_id_string','')}': {offs.size} offsets, "
+            f"Larmor {larmor:.4f} MHz" + (f", B1 {float(b1):g} µT" if b1 else ""))
 
     def _browse_wassr(self):
         d = QFileDialog.getExistingDirectory(self, "Select WASSR scan folder", "")
@@ -1622,6 +1921,10 @@ class ZSpecTab(QWidget):
             self._load_cest_bruker()
         elif v.startswith("MR Solutions"):
             self._load_cest_mrd()
+        elif v.startswith("MATLAB"):
+            self._load_cest_mat()
+        elif v.startswith("Siemens TWIX"):
+            self._load_cest_twix()
         else:
             self._load_cest_ge()
 
@@ -1631,6 +1934,10 @@ class ZSpecTab(QWidget):
             self._load_wassr_bruker()
         elif v.startswith("MR Solutions"):
             self._load_wassr_mrd()
+        elif v.startswith("MATLAB"):
+            self._load_wassr_mat()
+        elif v.startswith("Siemens TWIX"):
+            self._load_wassr_twix()
         else:
             self._load_wassr_ge()
 
@@ -1816,6 +2123,118 @@ class ZSpecTab(QWidget):
 
     # ── concrete load methods ─────────────────────────────────────────────
 
+    # ── MATLAB (.mat) single-file loaders (vendor-neutral) ───────────────────
+
+    def _load_cest_mat(self):
+        """Load a CEST Z-stack from one .mat file (GE / Siemens / Bruker export).
+        The image array and ppm vector are auto-detected (my_gui.mat_reader);
+        an optional offsets .txt (ppm) overrides the vector."""
+        if not self._cest_mat_path:
+            self._log("Please browse to a CEST .mat file first.")
+            return
+        try:
+            from my_gui.mat_reader import read_mat_cest
+            self._log(f"Loading MATLAB CEST: {self._cest_mat_path}")
+            QApplication.processEvents()
+            offs = (np.loadtxt(self._cest_mat_ppm_path).ravel()
+                    if self._cest_mat_ppm_path else None)
+            data, ppm_all = read_mat_cest(self._cest_mat_path, offsets=offs,
+                                          keep_slices=True)
+            _finish_cest_load(self, data, ppm_all, source="MATLAB (.mat)")
+        except Exception as exc:
+            self.lbl_cest_info.setText(f"Error: {exc}")
+            self.lbl_cest_info.setStyleSheet("font-size:11px;color:red;")
+            self._log(f"ERROR loading MATLAB CEST: {exc}")
+
+    def _load_wassr_mat(self):
+        """Load a WASSR stack from one .mat file (any vendor) → B0 map."""
+        if not self._wassr_mat_path:
+            self._log("Please browse to a WASSR .mat file first.")
+            return
+        try:
+            from my_gui.mat_reader import read_mat_cest
+            self._log(f"Loading MATLAB WASSR: {self._wassr_mat_path}")
+            QApplication.processEvents()
+            offs = (np.loadtxt(self._wassr_mat_ppm_path).ravel()
+                    if self._wassr_mat_ppm_path else None)
+            data, ppm_all = read_mat_cest(self._wassr_mat_path, offsets=offs,
+                                          keep_slices=True)
+            _finish_wassr_load(self, data, ppm_all, source="MATLAB (.mat)")
+        except Exception as exc:
+            self.lbl_wassr_info.setText(f"Error: {exc}")
+            self.lbl_wassr_info.setStyleSheet("font-size:11px;color:red;")
+            self._log(f"ERROR loading MATLAB WASSR: {exc}")
+
+    # ── Siemens TWIX (.dat) loaders — OCEAN reconstructs the raw k-space ─────
+
+    def _load_cest_twix(self):
+        """CEST from Siemens raw data: 2-D iFFT + sum-of-squares per offset
+        (my_gui.siemens_twix_reader).  Offsets come from a .seq / .txt."""
+        if not self._cest_twix_path:
+            self._log("Please browse to a CEST .dat (TWIX) file first.")
+            return
+        try:
+            from my_gui.siemens_twix_reader import is_available, read_twix_cest
+            if not is_available():
+                raise ImportError(
+                    "twixtools is not installed — run:  pip install twixtools  "
+                    "(in the environment OCEAN runs from, e.g. cbdmrf)")
+            self._log(f"Reconstructing Siemens TWIX CEST: {self._cest_twix_path}")
+            QApplication.processEvents()
+            npe = int(self.spin_cest_twix_npe.value()) or None
+            stack, M0, info = read_twix_cest(
+                self._cest_twix_path,
+                slice_idx=int(self.spin_cest_twix_slice.value()),
+                lines_per_image=npe)
+            n_off = stack.shape[3]
+            if not self._cest_twix_ppm_path:
+                self._log("  ⚠ no offsets (.seq/.txt) chosen — using a sequential "
+                          "index axis; pick the offsets and reload for a ppm axis.")
+            ppm_all = self._twix_offsets_from(self._cest_twix_ppm_path, n_off,
+                                              self._cest_twix_path, self._log)
+            self._log(f"  TWIX recon: {info['matrix'][0]}×{info['matrix'][1]} px, "
+                      f"{n_off} offsets, {info['n_coils']} coils, "
+                      f"M0 = frame {info['m0_frame_idx']}")
+            _finish_cest_load(self, stack, ppm_all, source="Siemens TWIX (.dat)",
+                              m0_override=M0)
+        except Exception as exc:
+            self.lbl_cest_info.setText(f"Error: {exc}")
+            self.lbl_cest_info.setStyleSheet("font-size:11px;color:red;")
+            self._log(f"ERROR loading Siemens TWIX CEST: {exc}")
+            import traceback; self._log(traceback.format_exc())
+
+    def _load_wassr_twix(self):
+        """WASSR from Siemens raw data (same reconstruction) → B0 map."""
+        if not self._wassr_twix_path:
+            self._log("Please browse to a WASSR .dat (TWIX) file first.")
+            return
+        try:
+            from my_gui.siemens_twix_reader import is_available, read_twix_cest
+            if not is_available():
+                raise ImportError(
+                    "twixtools is not installed — run:  pip install twixtools  "
+                    "(in the environment OCEAN runs from, e.g. cbdmrf)")
+            self._log(f"Reconstructing Siemens TWIX WASSR: {self._wassr_twix_path}")
+            QApplication.processEvents()
+            npe = int(self.spin_wassr_twix_npe.value()) or None
+            stack, M0, info = read_twix_cest(
+                self._wassr_twix_path,
+                slice_idx=int(self.spin_wassr_twix_slice.value()),
+                lines_per_image=npe)
+            n_off = stack.shape[3]
+            if not self._wassr_twix_ppm_path:
+                self._log("  ⚠ no WASSR offsets (.seq/.txt) chosen — using a "
+                          "sequential index axis.")
+            ppm_all = self._twix_offsets_from(self._wassr_twix_ppm_path, n_off,
+                                              self._wassr_twix_path, self._log)
+            _finish_wassr_load(self, stack, ppm_all, source="Siemens TWIX (.dat)",
+                               m0_override=M0)
+        except Exception as exc:
+            self.lbl_wassr_info.setText(f"Error: {exc}")
+            self.lbl_wassr_info.setStyleSheet("font-size:11px;color:red;")
+            self._log(f"ERROR loading Siemens TWIX WASSR: {exc}")
+            import traceback; self._log(traceback.format_exc())
+
     def _load_cest_bruker(self):
         if not self._cest_dir:
             self._log("Please browse to a CEST 2dseq directory first.")
@@ -1831,6 +2250,29 @@ class ZSpecTab(QWidget):
             self._z_img_all = info.get("img_all")
             self._ppm_all   = info.get("ppm_all")
             self._cest_m0_auto_idx = int(info.get("m0_frame_idx", 0))
+            # Robust M0: the reader picks the largest-|ppm| frame as M0 (e.g. a
+            # +100 ppm far-off-resonance reference). On some acquisitions that
+            # dedicated M0 frame is anomalously low-signal (non-steady-state /
+            # short-Trec M0), which makes S/M0 > 1 — the whole Z-spectrum baseline
+            # rides above 1.0. Guard: if another frame is clearly higher-signal,
+            # use the highest-signal frame (the true unsaturated reference) as M0.
+            try:
+                _ia = self._z_img_all
+                if _ia is not None and np.asarray(_ia).ndim == 4 and _ia.shape[-1] > 1:
+                    _sl = _ia[:, :, self._cur_slice(_ia.shape[2]), :]
+                    _fs = np.nanmean(_sl.reshape(-1, _sl.shape[-1]), axis=0)
+                    _best = int(np.nanargmax(_fs))
+                    _cur = self._cest_m0_auto_idx
+                    if 0 <= _cur < _fs.size and _fs[_best] > 1.02 * _fs[_cur]:
+                        self._log(
+                            f"Auto-M0: reader's M0 frame "
+                            f"({self._ppm_all[_cur]:+.1f} ppm) is "
+                            f"{100*(1 - _fs[_cur]/_fs[_best]):.0f}% below the "
+                            f"highest-signal frame ({self._ppm_all[_best]:+.1f} ppm) "
+                            f"— using the latter as M0 (fixes Z baseline > 1.0).")
+                        self._cest_m0_auto_idx = _best
+            except Exception:
+                pass
             try:
                 _sp = info.get('satpwr_uT', None)
                 if _sp is not None and float(_sp) > 0:
@@ -3084,6 +3526,13 @@ class ZSpecTab(QWidget):
 
     def _refresh_display(self):
         self._dc_annot = None   # reset data cursor (axes rebuilt on show_map)
+        # Display mode: "ROIs + Bkg" restricts colour to the drawn measurement
+        # ROIs; "ROIs only" also includes any outline (brain/phantom) drawn.
+        # Both paint the colour over the chosen Bkg image.
+        _roi_only = (getattr(self, "chk_roi_only", None) is not None
+                     and self.chk_roi_only.isChecked())
+        _overlay_on = _roi_only or self.chk_roi_bg.isChecked()
+        _excl = () if _roi_only else ("Phantom_outline", "Brain_outline", "Mouse_Brain_outline")
         # Propagate the "Bg" toggle to the canvas (read by show_map on redraw).
         if hasattr(self, 'chk_dark_bg'):
             self.canvas._dark_bg = self.chk_dark_bg.isChecked()
@@ -3220,7 +3669,7 @@ class ZSpecTab(QWidget):
                 fin = sl[np.isfinite(sl)] if sl is not None else np.array([])
                 lim = float(np.nanpercentile(np.abs(fin), 99)) if fin.size else 0.5
                 vmin, vmax = -lim, lim
-            if self.chk_roi_bg.isChecked():
+            if _overlay_on:
                 _base = None
                 if getattr(self, "_z_img_full", None) is not None:
                     _zf = self._z_img_full
@@ -3228,7 +3677,7 @@ class ZSpecTab(QWidget):
                     _base = np.asarray(_zf)[:, :, _si, 0]
                 if getattr(self, "_roi_bg_img", None) is not None:
                     _base = self._roi_bg_img
-                _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape)
+                _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape, exclude=_excl)
                 if _base is not None and _union is not None:
                     _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                     self.canvas.show_map_over_raw(
@@ -3278,7 +3727,7 @@ class ZSpecTab(QWidget):
                 fin = sl[np.isfinite(sl)] if sl is not None else np.array([])
                 lim = float(np.nanpercentile(np.abs(fin), 99)) if fin.size else 100.0
                 vmin, vmax = -lim, lim
-            if self.chk_roi_bg.isChecked():
+            if _overlay_on:
                 _base = None
                 if getattr(self, "_z_img_full", None) is not None:
                     _zf = self._z_img_full
@@ -3286,7 +3735,7 @@ class ZSpecTab(QWidget):
                     _base = np.asarray(_zf)[:, :, _si, 0]
                 if getattr(self, "_roi_bg_img", None) is not None:
                     _base = self._roi_bg_img
-                _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape)
+                _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape, exclude=_excl)
                 if _base is not None and _union is not None:
                     _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                     self.canvas.show_map_over_raw(
@@ -3386,7 +3835,7 @@ class ZSpecTab(QWidget):
                     _amap = np.where(_msk, _amap, np.nan)
             _fin  = _amap[np.isfinite(_amap)]
             _lim  = float(np.nanpercentile(np.abs(_fin), 99)) if _fin.size else 1.0
-            if self.chk_roi_bg.isChecked():
+            if _overlay_on:
                 _base = None
                 if getattr(self, "_z_img_full", None) is not None:
                     _zf = self._z_img_full
@@ -3394,7 +3843,7 @@ class ZSpecTab(QWidget):
                     _base = np.asarray(_zf)[:, :, _si, 0]
                 if getattr(self, "_roi_bg_img", None) is not None:
                     _base = self._roi_bg_img
-                _union = roi_union_mask(getattr(self, "_last_rois", []), _amap.shape)
+                _union = roi_union_mask(getattr(self, "_last_rois", []), _amap.shape, exclude=_excl)
                 if _base is not None and _union is not None:
                     _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                     self.canvas.show_map_over_raw(
@@ -3475,7 +3924,7 @@ class ZSpecTab(QWidget):
                 else:
                     vmin_use, vmax_use = vmin, vmax
                 default_t = f"MTR Asymmetry (±{self._results.get('mtr_ppm_used', 3.5):.2f} ppm)"
-                if self.chk_roi_bg.isChecked():
+                if _overlay_on:
                     _base = None
                     if getattr(self, "_z_img_full", None) is not None:
                         _zf = self._z_img_full
@@ -3483,7 +3932,7 @@ class ZSpecTab(QWidget):
                         _base = np.asarray(_zf)[:, :, _si, 0]
                     if getattr(self, "_roi_bg_img", None) is not None:
                         _base = self._roi_bg_img
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape)
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -3506,7 +3955,7 @@ class ZSpecTab(QWidget):
                 else:
                     vmin_use, vmax_use = vmin, vmax
                 default_t = f"MTR_Rex (±{self._results.get('mtrrex_ppm_used', 3.5):.2f} ppm)"
-                if self.chk_roi_bg.isChecked():
+                if _overlay_on:
                     _base = None
                     if getattr(self, "_z_img_full", None) is not None:
                         _zf = self._z_img_full
@@ -3514,7 +3963,7 @@ class ZSpecTab(QWidget):
                         _base = np.asarray(_zf)[:, :, _si, 0]
                     if getattr(self, "_roi_bg_img", None) is not None:
                         _base = self._roi_bg_img
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape)
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -3549,7 +3998,7 @@ class ZSpecTab(QWidget):
             if data is not None:
                 sl = data[:, :, self._cur_slice(data.shape[2])] if data.ndim == 3 else data
                 sl = _ph_mask(sl)
-                if self.chk_roi_bg.isChecked():
+                if _overlay_on:
                     _base = None
                     if getattr(self, "_z_img_full", None) is not None:
                         _zf = self._z_img_full
@@ -3557,7 +4006,7 @@ class ZSpecTab(QWidget):
                         _base = np.asarray(_zf)[:, :, _si, 0]
                     if getattr(self, "_roi_bg_img", None) is not None:
                         _base = self._roi_bg_img
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape)
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), sl.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(

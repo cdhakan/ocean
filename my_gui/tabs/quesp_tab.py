@@ -570,6 +570,15 @@ class QUESPTab(QWidget):
         self.combo_display.currentIndexChanged.connect(self._refresh_display)
         ctrl_row.addWidget(self.combo_display, stretch=1)
 
+        # "ROIs only" — colored map inside every ROI + any outline drawn, over
+        # the chosen Bkg image.
+        self.chk_roi_only = QCheckBox("ROIs only")
+        self.chk_roi_only.setToolTip(
+            "Show the colored map inside the ROIs (and any outline drawn), over "
+            "the chosen Bkg image.")
+        self.chk_roi_only.toggled.connect(self._refresh_display)
+        ctrl_row.addWidget(self.chk_roi_only)
+
         # "ROIs + Bg" — colored map only inside the drawn ROIs, over the 1st
         # raw image shown in grayscale outside the ROIs.
         self.chk_roi_bg = QCheckBox("ROIs + Bkg")
@@ -578,6 +587,11 @@ class QUESPTab(QWidget):
             "as a gray background.")
         self.chk_roi_bg.toggled.connect(self._refresh_display)
         ctrl_row.addWidget(self.chk_roi_bg)
+        # Mutually exclusive with ROIs only.
+        self.chk_roi_only.toggled.connect(
+            lambda on: on and self.chk_roi_bg.setChecked(False))
+        self.chk_roi_bg.toggled.connect(
+            lambda on: on and self.chk_roi_only.setChecked(False))
 
         # "Bkg…" — pick ANY image (from the Scan Directory or browse) as the
         # grayscale background for the "ROIs + Bkg" overlay.
@@ -699,6 +713,13 @@ class QUESPTab(QWidget):
         self.btn_roi_table = QPushButton("ROI Statistics")
         self.btn_roi_table.clicked.connect(self._show_roi_table)
         _roi_btn_row.addWidget(self.btn_roi_table)
+
+        self.btn_mtr_asym = QPushButton("MTR Asym (multi-B1)")
+        self.btn_mtr_asym.setToolTip(
+            "Plot MTR asymmetry (Z(−Δω) − Z(+Δω)) for every loaded B1 power, per ROI,\n"
+            "and fit each B1's Z-spectrum with Pseudo-Voigt / MPLF (amplitude vs B1).")
+        self.btn_mtr_asym.clicked.connect(self._show_multib1_mtrasym)
+        _roi_btn_row.addWidget(self.btn_mtr_asym)
         right_l.addLayout(_roi_btn_row)
 
         # Data cursor checkbox
@@ -2131,12 +2152,20 @@ class QUESPTab(QWidget):
                 _probe = sio.loadmat(path, squeeze_me=True)
             except Exception:
                 _probe = None
-        if not (_probe is not None and 'satpwr_uT' in _probe
-                and any(str(k).startswith('mtrrex__') for k in _probe)):
+        _has_roi = (_probe is not None and 'satpwr_uT' in _probe
+                    and any(str(k).startswith('mtrrex__') for k in _probe))
+        # Per-voxel Z-stacks embedded by the Inverse-Z tab's export → the slow
+        # fs/ksw/R² MAP fit runs here on demand (not after every Inverse-Z Run).
+        _has_vox = (_probe is not None and 'zimg__0' in _probe)
+        if not (_has_roi or _has_vox):
             self._display_loaded_figures(path)
             return
+        m = _probe
+        if not _has_roi:
+            # Voxel-only stack (saved before any ROI 1/Z fit) → straight to maps.
+            self._invz_maps_from_stack(m, path)
+            return
         try:
-            m = _probe
             b1 = np.atleast_1d(np.asarray(m["satpwr_uT"], dtype=float)).ravel()
             pools = [str(x) for x in np.atleast_1d(m["pools"]).ravel()]
             rnames = [str(x) for x in np.atleast_1d(m["roi_names"]).ravel()]
@@ -2159,6 +2188,9 @@ class QUESPTab(QWidget):
                 rows.append((rname, pool, r["fs"], r["ksw"],
                              fs_to_concentration(r["fs"], nH), r["r2"], r["n"]))
         if not rows:
+            if _has_vox:
+                self._invz_maps_from_stack(m, path)
+                return
             QMessageBox.information(self, "No data",
                                     "No fittable pools found in the stack.")
             return
@@ -2180,6 +2212,13 @@ class QUESPTab(QWidget):
         dl.addWidget(tbl)
         self._quesp_1z_rows = rows   # keep for CSV copy
         br = QHBoxLayout()
+        if _has_vox:
+            btn_maps = QPushButton("🗺 Generate fs / ksw maps (per-voxel)")
+            btn_maps.setToolTip(
+                "Run the full MT+CEST 1/Z fit per voxel from the Z-stacks embedded "
+                "in this .mat, then QUESP → fs / ksw / R² maps on the canvas.")
+            btn_maps.clicked.connect(lambda: self._invz_maps_from_stack(m, path))
+            br.addWidget(btn_maps)
         btn_csv = QPushButton("📋 Copy (CSV)")
         def _copy():
             from PyQt6.QtWidgets import QApplication
@@ -2192,6 +2231,178 @@ class QUESPTab(QWidget):
         _bc = QPushButton("Close"); _bc.clicked.connect(dlg.accept); br.addWidget(_bc)
         dl.addLayout(br)
         dlg.show()
+
+    # ── Per-voxel fs / ksw / R² maps from an Inverse-Z 1/Z stack (.mat) ──────
+
+    def _invz_maps_from_stack(self, m: dict, path: str = ""):
+        """Per-voxel fs / ksw / R² maps from a 1/Z stack .mat that embeds the
+        voxel inputs (Inverse-Z tab → “Save 1/Z → QUESP (.mat)”).
+
+        Runs the full MT + CEST 1/Z fit per voxel in the background — on
+        demand here, instead of automatically after every Inverse-Z Run (that
+        made Run unacceptably slow)."""
+        from PyQt6.QtWidgets import QMessageBox
+        try:
+            from my_gui.tabs.inv_zspec_tab import InvZQUESPWorker
+        except Exception as exc:
+            QMessageBox.warning(self, "Unavailable",
+                                f"Inverse-Z worker not importable:\n{exc}")
+            return
+        w = getattr(self, "_invz_worker", None)
+        if w is not None and w.isRunning():
+            QMessageBox.information(self, "Busy",
+                                    "A per-voxel map fit is already running.")
+            return
+
+        def _scalar(key, default):
+            v = m.get(key, None)
+            if v is None:
+                return default
+            return np.asarray(v).ravel()[0]
+
+        def _pair(key, default):
+            v = m.get(key, None)
+            if v is None:
+                return default
+            v = np.atleast_1d(np.asarray(v, dtype=float)).ravel()
+            return (float(v[0]), float(v[-1]))
+
+        def _strs(key):
+            v = m.get(key, None)
+            if v is None:
+                return []
+            return [str(x) for x in np.atleast_1d(v).ravel() if str(x).strip()]
+
+        try:
+            n_b1 = int(_scalar("n_b1", 0))
+            b1 = np.atleast_1d(np.asarray(m["b1_ut"], dtype=float)).ravel()[:n_b1]
+            datasets = []
+            for i in range(n_b1):
+                z = np.asarray(m[f"zimg__{i}"], dtype=np.float32)
+                ppm = np.atleast_1d(np.asarray(m[f"ppm__{i}"], dtype=float)).ravel()
+                datasets.append(dict(z_img=z, ppm=ppm, b1_ut=float(b1[i]),
+                                     slice=0, path=path))
+            params = dict(
+                R1=float(_scalar("R1", 1.0)),
+                B0_MHz=float(_scalar("B0_MHz", 300.0)),
+                peak_type=str(_scalar("peak_type", "lorentzian")),
+                ppm_exclude_MT=_pair("ppm_exclude_MT", (-1.0, 1.0)),
+                ppm_reinclude_MT=_pair("ppm_reinclude_MT", (-0.3, 0.3)),
+                ppm_include_CEST=_pair("ppm_include_CEST", (0.0, 6.0)),
+                fit_mt=bool(int(_scalar("fit_mt", 1))),
+                satpwr_uT=float(b1[0]) if b1.size else 0.0,
+            )
+            pools  = _strs("pools_all")
+            qpools = _strs("qpools")
+            mask = m.get("mask", None)
+            mask = ((np.asarray(mask) > 0)
+                    if mask is not None and np.asarray(mask).ndim == 2 else None)
+            max_dim = int(_scalar("max_fit_dim", 96))
+        except Exception as exc:
+            QMessageBox.warning(self, "Load failed",
+                                f"Could not read the per-voxel inputs:\n{exc}")
+            return
+        if n_b1 < 3:
+            QMessageBox.warning(self, "Need ≥3 B1 powers",
+                                "Per-voxel QUESP needs at least 3 saturation "
+                                f"powers (this stack has {n_b1}).")
+            return
+        if not pools:
+            QMessageBox.warning(self, "No pools",
+                                "The stack lists no fitted pools (pools_all).")
+            return
+
+        Yf, Xf = datasets[0]["z_img"].shape[:2]
+        f = max(1, int(np.ceil(max(Yf, Xf) / float(max_dim))))
+        n_mask = int(mask.sum()) if mask is not None else Yf * Xf
+        est = max(1, n_mask // (f * f))
+        show_pools = qpools or [p for p in pools if p not in ("water", "MT")]
+        ans = QMessageBox.question(
+            self, "Generate fs / ksw maps?",
+            "Fit the full MT + CEST 1/Z pipeline per voxel, then QUESP.\n\n"
+            f"  • B1 powers: {n_b1}\n"
+            f"  • Pools: {', '.join(show_pools)}\n"
+            f"  • ~{est} voxels at ×{f} downsample\n\n"
+            "This can take a few minutes. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        nH = int(self.spin_n_protons.value()) if hasattr(self, "spin_n_protons") else 1
+        self._invz_out_pools = qpools or None
+        self._invz_worker = InvZQUESPWorker(datasets, params, pools, mask,
+                                            n_H=nH, max_fit_dim=max_dim)
+        self._invz_worker.log.connect(
+            lambda s: self.lbl_proc_status.setText(str(s)[:220]))
+        self._invz_worker.progress.connect(self.progress_bar.setValue)
+        self._invz_worker.finished.connect(self._on_invz_maps_done)
+        self._invz_worker.error.connect(self._on_invz_maps_error)
+        self._invz_worker.cancelled.connect(
+            lambda: self._on_invz_maps_error("Cancelled."))
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.lbl_proc_status.setText(
+            "Generating per-voxel fs / ksw / R² maps from the 1/Z stack…")
+        self.lbl_proc_status.setStyleSheet("color: #e0a800; font-size: 10px;")
+        self._invz_worker.start()
+
+    def _on_invz_maps_done(self, results: dict):
+        from PyQt6.QtWidgets import QInputDialog
+        self.progress_bar.hide()
+        qmaps = results.get("quesp_maps", {}) or {}
+        pools = [p for p in results.get("pools", list(qmaps)) if p in qmaps]
+        outp = getattr(self, "_invz_out_pools", None)
+        if outp:
+            pools = [p for p in pools if p in outp] or pools
+        if not pools:
+            self._on_invz_maps_error("No pool maps were produced.")
+            return
+        self._invz_quesp_maps = {p: qmaps[p] for p in pools}   # keep every pool
+        pool = pools[0]
+        if len(pools) > 1:
+            choice, ok = QInputDialog.getItem(
+                self, "Pool for maps", "Show fs / ksw / R² maps for pool:",
+                pools, 0, False)
+            if ok and choice:
+                pool = choice
+        self._apply_invz_pool_maps(pool)
+
+    def _apply_invz_pool_maps(self, pool: str):
+        """Put one pool's per-voxel maps into the tab's fs / ksw / R² display
+        slots (same path as _on_fit_done) and show the fs map."""
+        mp = self._invz_quesp_maps[pool]
+
+        def _clean(a):
+            a = np.asarray(a, dtype=float)
+            return np.where(np.isfinite(a), a, 0.0)
+
+        fs  = apply_analysis_mask(_clean(mp["fs"]))
+        ksw = apply_analysis_mask(_clean(mp["ksw"]))
+        r2  = apply_analysis_mask(_clean(mp["r2"]))
+        self._fs_map, self._ksw_map, self._rsq_map = fs, ksw, r2
+        n_fit = int((fs > 0).sum())
+        n_p = self.spin_n_protons.value()
+        if n_fit > 0:
+            fs_v, ksw_v = fs[fs > 0], ksw[ksw > 0]
+            self.lbl_proc_status.setText(
+                f"Per-voxel QUESP from 1/Z stack — pool {pool}: {n_fit} voxels.\n"
+                f"fs: [{fs_v.min():.2e}–{fs_v.max():.2e}]  "
+                f"({fs_v.min()*110000/n_p:.2g}–{fs_v.max()*110000/n_p:.2g} mM)\n"
+                f"ksw: [{ksw_v.min():.0f}–{ksw_v.max():.0f}] s⁻¹"
+                if ksw_v.size else
+                f"Per-voxel QUESP from 1/Z stack — pool {pool}: {n_fit} voxels.")
+        else:
+            self.lbl_proc_status.setText(
+                f"Per-voxel QUESP from 1/Z stack — pool {pool}: no voxels fitted "
+                "(check ≥3 B1 powers / pool selection).")
+        self.lbl_proc_status.setStyleSheet("color: #4ec9b0; font-size: 10px;")
+        self.combo_display.setCurrentText("fs Map (mM)")
+        self._refresh_display()
+
+    def _on_invz_maps_error(self, msg: str):
+        self.progress_bar.hide()
+        self.lbl_proc_status.setText(f"Per-voxel maps: {msg}")
+        self.lbl_proc_status.setStyleSheet("color: red; font-size: 10px;")
 
     def _run_fit(self):
         # Always (re-)compute the QUESP effect from raw data first
@@ -2514,6 +2725,14 @@ class QUESPTab(QWidget):
         if getattr(self, "_roi_bg_img", None) is not None:
             _base = self._roi_bg_img
 
+        # Display mode: "ROIs + Bkg" restricts colour to the drawn measurement
+        # ROIs; "ROIs only" also includes any outline (brain/phantom) drawn.
+        # Both paint the colour over _base (the chosen Bkg).
+        _roi_only = (getattr(self, "chk_roi_only", None) is not None
+                     and self.chk_roi_only.isChecked())
+        _overlay_on = _roi_only or self.chk_roi_bg.isChecked()
+        _excl = () if _roi_only else ("Phantom_outline", "Brain_outline", "Mouse_Brain_outline")
+
         # Show/hide B1 slider frame
         _show_b1_slider = (choice == "QUESP Images")
         self._img_slider_frame.setVisible(_show_b1_slider)
@@ -2529,8 +2748,8 @@ class QUESPTab(QWidget):
                 fin = a[np.isfinite(a)] if a is not None else np.array([])
                 _vmx = vmax if vmax is not None else (
                     float(np.nanpercentile(fin, 99)) if fin.size else None)
-                if self.chk_roi_bg.isChecked():
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), arr.shape)
+                if _overlay_on:
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), arr.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -2565,8 +2784,8 @@ class QUESPTab(QWidget):
                 fs_mM = _mask(self._fs_map) * (110000.0 / n_p)
                 fin = fs_mM[np.isfinite(fs_mM) & (fs_mM > 0)] if fs_mM is not None else np.array([])
                 vmax_mM = vmax if vmax is not None else (float(np.nanpercentile(fin, 99)) if fin.size else 10.0)
-                if self.chk_roi_bg.isChecked():
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), fs_mM.shape)
+                if _overlay_on:
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), fs_mM.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -2578,8 +2797,8 @@ class QUESPTab(QWidget):
                                      cmap=cmap, vmin=vmin or 0, vmax=vmax_mM, **qfs)
         elif choice == "ksw Map (s⁻¹)":
             if self._ksw_map is not None:
-                if self.chk_roi_bg.isChecked():
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), self._ksw_map.shape)
+                if _overlay_on:
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), self._ksw_map.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -2592,8 +2811,8 @@ class QUESPTab(QWidget):
             if self._rsq_map is not None:
                 _vmin = vmin if vmin is not None else 0
                 _vmax = vmax if vmax is not None else 1
-                if self.chk_roi_bg.isChecked():
-                    _union = roi_union_mask(getattr(self, "_last_rois", []), self._rsq_map.shape)
+                if _overlay_on:
+                    _union = roi_union_mask(getattr(self, "_last_rois", []), self._rsq_map.shape, exclude=_excl)
                     if _base is not None and _union is not None:
                         _ovc = cmap if str(cmap).lower() not in ("gray", "greys", "greys_r") else "jet"
                         self.canvas.show_map_over_raw(
@@ -2856,6 +3075,15 @@ class QUESPTab(QWidget):
     def _update_roi_stats(self, rois: list):
         self._last_rois = list(rois)
         # Stats shown on demand via the ROI Stats Table button
+
+    def _show_multib1_mtrasym(self):
+        """Multi-B1 MTR-asymmetry (one curve per B1 power, per ROI) + per-B1
+        Pseudo-Voigt / MPLF pool-fit amplitude-vs-B1 view."""
+        from my_gui.multib1_analysis import show_multib1_mtrasym
+        sl = (self.spin_slice.value() - 1) if hasattr(self, 'spin_slice') else 0
+        self._mtr_asym_dlg = show_multib1_mtrasym(
+            self, getattr(self, '_datasets', []), getattr(self, '_last_rois', []),
+            slice_idx=max(0, sl), title="QUESP — Multi-B1 MTR Asymmetry")
 
     def _show_roi_table(self):
         """ROI statistics = the ROI-MEAN QUESP fit, reported SEPARATELY for each

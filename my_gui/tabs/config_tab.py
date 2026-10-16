@@ -15,6 +15,24 @@ from my_gui.theme import dc
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def _sweep_or_list(list_text, mn, mx, st) -> "np.ndarray":
+    """Explicit comma/space-separated list if `list_text` is non-empty, else the
+    uniform ``arange(mn, mx+st, st)`` sweep.
+
+    Lets users specify non-uniform grids a single step can't make — e.g.
+    ``1,5,10,15,20,25,30`` (arange from 1 with step 5 would give 1,6,11,…)."""
+    toks = [t for t in str(list_text or "").replace(",", " ").split() if t.strip()]
+    if toks:
+        vals = []
+        for t in toks:
+            try:
+                vals.append(float(t))
+            except ValueError:
+                pass
+        if vals:
+            return np.array(sorted(set(vals)), dtype=float)
+    return np.arange(mn, mx + st, st, dtype=float)
+
 
 def _make_sweep_row(*pairs) -> QHBoxLayout:
     """
@@ -325,6 +343,8 @@ class ConfigTab(QWidget):
         self.f_min  = QSpinBox(); self.f_min.setRange(1, 1000);   self.f_min.setValue(10)
         self.f_max  = QSpinBox(); self.f_max.setRange(1, 1000);   self.f_max.setValue(120)
         self.f_step = QSpinBox(); self.f_step.setRange(1, 100);   self.f_step.setValue(5)
+        self.f_list = QLineEdit()
+        self.f_list.setPlaceholderText("or list, e.g. 1,5,10,15,20,25,30  (overrides min/max/step)")
 
         # CEST protons — integer 1-10, drives f = conc × n_protons / 110000
         self.cest_protons = QSpinBox()
@@ -345,6 +365,7 @@ class ConfigTab(QWidget):
             (self.k_min, "min"), (self.k_max, "max"), (self.k_step, "step")))
         form1.addRow("Concentration f (mM × n/110000):", _make_sweep_row(
             (self.f_min, "min"), (self.f_max, "max"), (self.f_step, "step")))
+        form1.addRow("Custom f list (mM):", self.f_list)
         cest_outer.addLayout(form1)          # ← into container, not outer
 
         # ── Second CEST pool ──────────────────────────────────────────
@@ -723,6 +744,8 @@ class ConfigTab(QWidget):
             self.f_min, self.f_max, self.f_step,
         ]:
             widget.valueChanged.connect(self._update_dict_size)
+        # Custom concentration list (QLineEdit → textChanged) also updates the size
+        self.f_list.textChanged.connect(self._update_dict_size)
 
         # CEST pool 2 — plain QSpinBox / QDoubleSpinBox
         for widget in [
@@ -881,9 +904,9 @@ class ConfigTab(QWidget):
                         self.k_max.value() + self.k_step.value(),
                         self.k_step.value())),
                     'dw': self.dw.value(),
-                    'f':  (np.arange(
-                        self.f_min.value(),
-                        self.f_max.value() + self.f_step.value(),
+                    'f':  (_sweep_or_list(
+                        self.f_list.text(),
+                        self.f_min.value(), self.f_max.value(),
                         self.f_step.value()) * n_p / 110000).tolist(),
                 }
             }

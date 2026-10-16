@@ -8,9 +8,9 @@ Get the latest build for your operating system from the **[Releases](../../relea
 
 | Platform | File | How to run |
 |----------|------|-----------|
-| Windows 10/11 | `OCEAN_Windows.zip` | Unzip → run `OCEAN.exe` |
-| macOS 11+ | `OCEAN_v*.dmg` | Open → drag to Applications |
-| Linux x86_64 | `OCEAN_Linux.tar.gz` | Extract → run `./OCEAN/OCEAN` |
+| Windows 10/11 | `OCEAN.zip` | Unzip → run `OCEAN.exe` |
+| macOS 11+ | `OCEAN.dmg` | Open → drag to Applications |
+| Linux x86_64 | `OCEAN.tar.gz` | Extract → run `./OCEAN/OCEAN` |
 
 > First launch on Windows may show a SmartScreen warning ("Unknown publisher") — click **More info → Run anyway**. On macOS, right‑click → **Open** the first time (unsigned app).
 
@@ -21,11 +21,11 @@ Get the latest build for your operating system from the **[Releases](../../relea
 - **Inverse‑Z (AREX)** — spillover/MT/T1‑corrected analysis with per‑pool QUESP *f*ₛ / *k*ₛw maps
 - **CEST‑MRF** — Pulseq schedule → Bloch–McConnell dictionary simulation + dot‑product matching
 - **Automation** — phantom detection & brain skull‑stripping; ROI statistics with X–Y agreement plots and box plots; 300‑dpi figure export (PNG/JPEG/TIFF/PDF/SVG)
-- **Vendor support** — Bruker (ParaVision), Siemens & GE (DICOM), MR Solutions (.MRD)
+- **Vendor support** — Bruker (ParaVision), Siemens & GE (DICOM / NIfTI), Siemens raw data (TWIX `.dat`, reconstructed in-app), MR Solutions (.MRD), MATLAB `.mat` stacks from any vendor
 
 ## Build from source
 
-Builds are produced entirely in the cloud by [GitHub Actions](.github/workflows/build.yml): pushing a version tag (`git tag v1.0.0 && git push origin v1.0.0`) builds all three platforms and publishes a Release. To build locally, install the dependencies and run `pyinstaller OCEAN.spec`.
+The Windows `.zip` and Linux `.tar.gz` are built by [GitHub Actions](.github/workflows/build.yml) when a version tag is pushed (`git push origin v1.0`) and attached to the Release. The macOS `.dmg` is built on a Mac with `bash build_dmg.sh` and uploaded to the same Release. To build locally, install the dependencies (`pip install -r requirements.txt`) and run `pyinstaller OCEAN.spec`.
 
 ## License
 

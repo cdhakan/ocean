@@ -371,6 +371,13 @@ class ROITab(QWidget):
                 if getattr(r, "name", "") == "Brain_outline":
                     r.mask = np.asarray(self._slice2d(m3d, idx), dtype=bool)
                     break
+        # Mouse brain outline follows the view too (separate cached 3-D mask).
+        mm3d = getattr(self.roi_panel, "_mouse_brain_mask_3d", None)
+        if mm3d is not None and getattr(mm3d, "ndim", 0) == 3 and mm3d.shape == vol.shape:
+            for r in self.canvas.get_rois():
+                if getattr(r, "name", "") == "Mouse_Brain_outline":
+                    r.mask = np.asarray(self._slice2d(mm3d, idx), dtype=bool)
+                    break
         title = getattr(self.canvas, "_last_title", None) or "Reference"
         self.canvas.show_map(self._ref_img, title, cmap="gray")
 

@@ -698,13 +698,17 @@ class ScanDirTab(QWidget):
         gs_fmt_row = QHBoxLayout()
         gs_fmt_row.addWidget(QLabel("Format:"))
         self.combo_gs_format = QComboBox()
-        self.combo_gs_format.addItems(["DICOM (.dcm)", "NIfTI (.nii)"])
-        self.combo_gs_format.setFixedWidth(140)
+        self.combo_gs_format.addItems(["DICOM (.dcm)", "NIfTI (.nii)", "MATLAB (.mat)",
+                                       "Siemens TWIX (.dat)"])
+        self.combo_gs_format.setFixedWidth(150)
         self.combo_gs_format.setToolTip(
             "DICOM: folder contains .dcm files (one per TR/TE/offset).\n"
             "NIfTI: T1 filenames include TR value (e.g. Tr_100); "
             "T2 echo files named *_e1.nii, *_e2.nii, …"
         )
+        # Connected AFTER addItems so the init-time index change does not fire
+        # before the modality cards exist.
+        self.combo_gs_format.currentIndexChanged.connect(self._on_gs_format_changed)
         gs_fmt_row.addWidget(self.combo_gs_format)
         self.btn_gs_detect = QPushButton("↻  Detect")
         self.btn_gs_detect.setFixedHeight(26)
@@ -872,18 +876,43 @@ class ScanDirTab(QWidget):
         return 199.7502
 
     def get_gs_format(self) -> str:
-        """Return 'dicom' or 'nifti' (only meaningful when vendor is GE/Siemens)."""
-        return "dicom" if self.combo_gs_format.currentIndex() == 0 else "nifti"
+        """Return 'dicom', 'nifti' or 'mat' (only meaningful when vendor is
+        GE/Siemens).  'mat' is vendor-neutral — a Bruker, GE or Siemens export
+        loads identically through my_gui.mat_reader."""
+        return {0: "dicom", 1: "nifti", 2: "mat", 3: "twix"}.get(
+            self.combo_gs_format.currentIndex(), "dicom")
+
+    def _apply_card_file_mode(self):
+        """Put the modality cards in single-file mode for MR Solutions (.MRD) and
+        for the vendor-neutral MATLAB (.mat) format; folder mode otherwise."""
+        idx = self.combo_scanner.currentIndex()
+        cards = list(getattr(self, "_cards", {}).values())
+        if idx == 2:
+            for c in cards:
+                c.set_file_mode(True, "MR Solutions raw (*.MRD *.mrd);;All files (*)")
+        elif idx == 1 and self.get_gs_format() in ("mat", "twix"):
+            flt = ("MATLAB files (*.mat);;All files (*)"
+                   if self.get_gs_format() == "mat"
+                   else "Siemens TWIX (*.dat);;All files (*)")
+            for c in cards:
+                c.set_file_mode(True, flt)
+        else:
+            for c in cards:
+                c.set_file_mode(False)
+
+    def _on_gs_format_changed(self, idx: int):
+        """DICOM / NIfTI / MATLAB / TWIX switch on the GE-Siemens page."""
+        self._apply_card_file_mode()
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _on_scanner_changed(self, idx: int):
         """Switch between Bruker / GE-Siemens / MR Solutions UI panels."""
         self._dir_stack.setCurrentIndex(idx)
-        # MR Solutions → cards pick single .MRD files; otherwise folders
+        # MR Solutions → cards pick single .MRD files; GE/Siemens with the
+        # MATLAB format → single .mat files; otherwise folders.
         mrd_mode = (idx == 2)
-        for card in self._cards.values():
-            card.set_file_mode(mrd_mode, "MR Solutions raw (*.MRD *.mrd);;All files (*)")
+        self._apply_card_file_mode()
         if mrd_mode:
             self._refresh_mrd_files()
         elif idx == 1 and self._gs_series:

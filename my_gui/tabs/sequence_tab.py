@@ -65,6 +65,50 @@ _COL_SLFA  = 6
 # .txt parser  (mirrors MATLAB logic exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_seq_definitions(filepath: str) -> dict:
+    """Read the [DEFINITIONS] block of a Pulseq .seq file as a plain dict.
+
+    Pure text parsing — no pypulseq import — so loading a schedule straight
+    from a .seq can never trip over pypulseq's packaging (the VERSION /
+    importlib.metadata FileNotFoundError seen in the bundled app).
+
+    Values: one token → scalar (float, or str when not numeric); several
+    tokens → list of floats (non-numeric tokens kept as str).  'nan' / 'inf'
+    parse as floats.  Raises ValueError when no [DEFINITIONS] section exists.
+    """
+    defs: dict = {}
+    in_defs = False
+
+    def _num(tok: str):
+        try:
+            return float(tok)
+        except ValueError:
+            return tok
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("["):
+                in_defs = line.upper().startswith("[DEFINITIONS]")
+                continue
+            if not in_defs:
+                continue
+            parts = line.split()
+            key, vals = parts[0], [_num(t) for t in parts[1:]]
+            if not vals:
+                defs[key] = ""
+            elif len(vals) == 1:
+                defs[key] = vals[0]
+            else:
+                defs[key] = vals
+    if not defs:
+        raise ValueError(
+            "No [DEFINITIONS] section found — is this a Pulseq .seq file?")
+    return defs
+
+
 def _parse_txt(filepath: str) -> list[list]:
     """
     Parse a Bruker MRF schedule .txt file.
@@ -971,6 +1015,7 @@ class SequenceTab(QWidget):
         toolbar.setSpacing(6)
 
         btn_load     = QPushButton("Load .txt")
+        btn_load_seq = QPushButton("Load .seq")
         btn_generate = QPushButton("Generate MRF schedule…")
         btn_add      = QPushButton("+ Row")
         btn_remove   = QPushButton("− Row")
@@ -1019,6 +1064,7 @@ class SequenceTab(QWidget):
         )
 
         btn_load.clicked.connect(self._load_txt)
+        btn_load_seq.clicked.connect(self._load_seq_file)
         btn_generate.clicked.connect(self._open_generator)
         self._btn_view_seq.clicked.connect(self._view_pulse_sequence)
         self._btn_pulseq_sim.clicked.connect(self._open_pulseq_simulation)
@@ -1027,6 +1073,7 @@ class SequenceTab(QWidget):
         btn_clear.clicked.connect(self._clear_table)
 
         toolbar.addWidget(btn_load)
+        toolbar.addWidget(btn_load_seq)
         toolbar.addWidget(btn_generate)
         # Thin separator before the pulseq viewer group
         sep = QFrame()
@@ -1275,6 +1322,91 @@ class SequenceTab(QWidget):
         )
         title = Path(fn).stem.replace("_", " ")
         self.lbl_plot_title.setText(title)
+        self._refresh_plot()
+
+    # ── Load schedule straight from a Pulseq .seq ─────────────────────────
+
+    @staticmethod
+    def _rows_from_seq_defs(seq_defs: dict) -> list[list]:
+        """[DEFINITIONS] of a .seq → 7-column table rows.
+
+        Exact inverse of get_seq_defs()'s timing model, so a schedule written
+        to .seq and loaded back lands on the same TR:
+            TR   = Trec + tsat + t_img + t_adc
+            tsat = n_pulses·tp + (n_pulses−1)·td   (+ 2·pw_90 for spin-lock)
+        Scalars in the file are broadcast to num_meas; n_pulses / td come from
+        the file (writer defaults as fallback); pw_90 / t_img / t_adc mirror
+        get_seq_defs().
+        """
+        def _lst(v):
+            return list(v) if isinstance(v, (list, tuple, np.ndarray)) else [v]
+
+        def _f(v, default=0.0):
+            try:
+                x = float(v)
+                return default if np.isnan(x) else x
+            except (TypeError, ValueError):
+                return default
+
+        per = {k: _lst(seq_defs.get(k, [])) for k in
+               ("tp", "Trec", "B1pa", "excFA", "SLFA", "SLflag", "offsets_ppm")}
+        n = int(_f(seq_defs.get("num_meas", 0), 0))
+        if n <= 0:
+            n = max((len(v) for v in per.values()), default=0)
+        if n <= 0:
+            raise ValueError("num_meas missing and no per-measurement arrays found")
+
+        def _get(key, i, default=0.0):
+            arr = per[key]
+            if not arr:
+                return default
+            return _f(arr[i] if i < len(arr) else arr[-1], default)
+
+        n_pulses = max(1, int(_f(seq_defs.get("n_pulses", 1), 1)))
+        td_s     = _f(seq_defs.get("td", 1e-5), 1e-5)
+        pw_90, t_img, t_adc = 0.1e-3, 2.1e-3, 1e-3        # == get_seq_defs()
+
+        rows = []
+        for i in range(n):
+            tp    = _get("tp", i)
+            trec  = _get("Trec", i)
+            is_sl = int(bool(_get("SLflag", i)))
+            tsat  = n_pulses * tp + max(n_pulses - 1, 0) * td_s
+            if is_sl:
+                tsat += 2.0 * pw_90
+            tr_ms = (trec + tsat + t_img + t_adc) * 1000.0
+            fa    = _get("excFA", i, 60.0)
+            rows.append([round(tr_ms, 1), round(_get("B1pa", i), 4),
+                         round(_get("offsets_ppm", i), 4), round(fa, 1),
+                         round(tp * 1000.0, 1), is_sl,
+                         round(_get("SLFA", i, fa), 1)])
+        return rows
+
+    def _load_seq_file(self):
+        """Fill the table straight from a Pulseq .seq ([DEFINITIONS] block) —
+        no regeneration and no pypulseq import."""
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Load schedule from .seq", "",
+            "Pulseq sequence (*.seq);;All files (*)")
+        if not fn:
+            return
+        try:
+            seq_defs = _parse_seq_definitions(fn)
+            rows = self._rows_from_seq_defs(seq_defs)
+        except Exception as e:
+            QMessageBox.critical(self, "Could not read .seq", str(e))
+            return
+
+        self._load_rows(rows)
+        self._loaded_fname = fn
+        b0 = seq_defs.get("B0", None)
+        extra = (f"  ·  B0 = {b0:g} T"
+                 if isinstance(b0, float) and np.isfinite(b0) else "")
+        self.lbl_loaded.setText(
+            f"Loaded .seq: {fn}  ({len(rows)} measurements{extra})")
+        self.lbl_loaded.setStyleSheet(
+            "font-size: 11px; color: #7ec97e; padding: 2px 0px;")
+        self.lbl_plot_title.setText(Path(fn).stem.replace("_", " "))
         self._refresh_plot()
 
     def _load_from_bruker(self):

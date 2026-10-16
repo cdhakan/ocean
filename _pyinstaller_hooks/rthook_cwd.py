@@ -1,4 +1,4 @@
-# PyInstaller runtime hook — set writable CWD before app starts
+# PyInstaller runtime hook - set writable CWD before app starts
 import sys, os
 from pathlib import Path
 if getattr(sys, 'frozen', False):
