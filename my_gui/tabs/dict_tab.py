@@ -523,7 +523,20 @@ class DictTab(QWidget):
             self.lbl_mrf_scan_path.setStyleSheet("color: #4ec9b0; font-size: 11px;")
             # Try to auto-load acquired_data.mat if present
             import os
-            acqmat = os.path.join(path, "acquired_data.mat")
+            from my_gui.mrf_convert import acquired_mat_path_for, classify
+            acqmat = acquired_mat_path_for(path)
+            kind = classify(path)
+            if kind != "bruker":
+                # TWIX / DICOM / NIfTI / .mat: the Scan Directory converts it in
+                # the background and app.py loads the result when it is ready.
+                if os.path.isfile(acqmat):
+                    self._set_acquired_data(acqmat, source=kind)
+                else:
+                    self._bruker_dir = os.path.dirname(acqmat)
+                    self.edit_bruker_dir.setText(self._bruker_dir)
+                    self.lbl_convert_status.setText(
+                        f"{kind} scan — converting to acquired_data.mat…")
+                return
             if os.path.isfile(acqmat):
                 self._set_acquired_data(acqmat, source="scan directory")
             else:

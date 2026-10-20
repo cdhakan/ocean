@@ -1219,13 +1219,60 @@ class T1T2Tab(QWidget):
             self.lbl_wasabi_scan_status.setText(
                 "Folder set — click Optimization to load & fit.")
 
+    def set_wasabi_scan(self, path: str, vendor: str = "bruker", pv360: bool = True):
+        """Scan Directory → WASABI card.  Sets the platform (Bruker / GE-Siemens),
+        the PV version, the data path and the source type (DICOM folder vs
+        NIfTI file, auto-detected from the path); the fit is run by the user."""
+        import os as _os, glob as _g
+        self._wasabi_data_path = path
+        if hasattr(self, "combo_wasabi_fmt"):
+            self.combo_wasabi_fmt.setCurrentText("Bruker" if vendor == "bruker" else "GE/Siemens")
+        if hasattr(self, "combo_wasabi_pv"):
+            self.combo_wasabi_pv.setCurrentText("PV360" if pv360 else "PV6 / PV7")
+        if vendor != "bruker" and _os.path.isdir(path):
+            nii = sorted(_g.glob(_os.path.join(path, "*.nii")) +
+                         _g.glob(_os.path.join(path, "*.nii.gz")))
+            if nii:                                  # NIfTI folder → its file
+                self._wasabi_data_path = nii[0]
+        if hasattr(self, "le_wasabi_dir"):
+            self.le_wasabi_dir.setText(self._wasabi_data_path)
+        self._sync_wasabi_scan_to_panel()
+        # Load straight away and, when the data could be loaded (offsets known:
+        # Bruker method / DICOM tags / a chosen .txt), run the B0/B1 fit too —
+        # the same "assign and analyse" behaviour as the other cards.
+        self._wasabi_z = None
+        try:
+            self._load_wasabi_data()
+            if getattr(self, "_wasabi_z", None) is not None:
+                self._run_wasabi_fit()
+                msg = "Scan loaded and fitted from the Scan Directory."
+            else:
+                msg = ("Scan set — " + self.lbl_wasabi_status.text()
+                       if hasattr(self, "lbl_wasabi_status") else "Scan set.")
+        except Exception as exc:
+            msg = f"Scan set — load/fit skipped: {exc}"
+        if hasattr(self, "lbl_wasabi_scan_status"):
+            self.lbl_wasabi_scan_status.setText(msg)
+
     def _sync_wasabi_scan_to_panel(self):
         """Push the main-tab Platform selection into the (hidden) source combo
-        the load backend branches on."""
+        the load backend branches on (GE/Siemens: NIfTI file when the path is
+        one, else DICOM folder)."""
         self._ensure_wasabi_panel()
         fmt = self.combo_wasabi_fmt.currentText() if hasattr(self, "combo_wasabi_fmt") else ""
         if hasattr(self, "combo_wasabi_src"):
-            self.combo_wasabi_src.setCurrentText("Bruker" if fmt == "Bruker" else "DICOM folder")
+            p = str(getattr(self, "_wasabi_data_path", "")).lower()
+            if fmt == "Bruker":
+                src = "Bruker"
+            elif p.endswith((".nii", ".nii.gz")):
+                src = "NIfTI file"
+            elif p.endswith(".dat"):
+                src = "Siemens TWIX (.dat)"
+            elif p.endswith(".7"):
+                src = "GE P-file (Orchestra)"
+            else:
+                src = "DICOM folder"
+            self.combo_wasabi_src.setCurrentText(src)
         path = getattr(self, "_wasabi_data_path", "")
         if path and hasattr(self, "le_wasabi_data"):
             self.le_wasabi_data.setText(path)
@@ -1286,7 +1333,8 @@ class T1T2Tab(QWidget):
         # Hidden source/version selectors — driven by the main-tab Platform combo.
         # Kept as attributes because the load backend branches on them.
         self.combo_wasabi_src = QComboBox()
-        self.combo_wasabi_src.addItems(["Bruker", "DICOM folder", "NIfTI file"])
+        self.combo_wasabi_src.addItems(["Bruker", "DICOM folder", "NIfTI file",
+                                        "Siemens TWIX (.dat)", "GE P-file (Orchestra)"])
         self.combo_wasabi_src.setVisible(False)
         self.combo_wasabi_src.currentIndexChanged.connect(self._on_wasabi_src_changed)
         self.combo_wasabi_pv = QComboBox(); self.combo_wasabi_pv.addItems(["PV360", "PV6 / PV7"])
@@ -1499,8 +1547,14 @@ class T1T2Tab(QWidget):
         Returns (image_2d, n_total). GE B1 series often store the B1 map as the
         2nd image, so the caller can select which frame/volume to use.
         """
-        from my_gui.tabs.image_viewer_tab import load_image_stack
-        stack, _labels = load_image_stack(path, log_fn=lambda *_a, **_k: None)
+        if str(path).lower().endswith(".mat"):
+            # MATLAB file: the largest image array, frames along the last axis
+            from my_gui.mat_reader import load_mat, _pick_image, _orient_stack
+            _, img = _pick_image(load_mat(path))
+            stack = _orient_stack(img, want_slices=False)        # (Y, X, N)
+        else:
+            from my_gui.tabs.image_viewer_tab import load_image_stack
+            stack, _labels = load_image_stack(path, log_fn=lambda *_a, **_k: None)
         n = stack.shape[2]
         idx = int(np.clip(frame - 1, 0, n - 1))
         return stack[:, :, idx].astype(float), n
@@ -1653,9 +1707,18 @@ class T1T2Tab(QWidget):
                 if not self._b1_fa1_dir or not self._b1_fa2_dir:
                     self.lbl_proc_status.setText("Select both FA folders first.")
                     return
+                # Bruker scan folders use the 2dseq reader; anything else
+                # (DICOM folder/file, NIfTI, .mat) goes through the generic
+                # single-image loader — the double-angle maths is the same.
+                from my_gui.mrf_convert import is_bruker_scan
                 from my_gui.bruker_reader import read_2dseq_b1_rare
-                self._b1_fa1_img = read_2dseq_b1_rare(self._b1_fa1_dir)
-                self._b1_fa2_img = read_2dseq_b1_rare(self._b1_fa2_dir)
+
+                def _load_fa(p):
+                    if is_bruker_scan(p):
+                        return read_2dseq_b1_rare(p)
+                    return self._load_single_2d(p, 1)[0]
+                self._b1_fa1_img = _load_fa(self._b1_fa1_dir)
+                self._b1_fa2_img = _load_fa(self._b1_fa2_dir)
                 self.lbl_proc_status.setText("B1 data loaded (double-angle).")
             elif m.startswith("Pre-computed"):
                 if not self._b1_pre_path:
@@ -2415,9 +2478,11 @@ class T1T2Tab(QWidget):
     def _browse_wasabi(self):
         from PyQt6.QtWidgets import QFileDialog
         src = self.combo_wasabi_src.currentText()
-        if src == "NIfTI file":
-            p, _ = QFileDialog.getOpenFileName(
-                self, "Select WASABI NIfTI", "", "NIfTI (*.nii *.nii.gz);;All files (*)")
+        _filters = {"NIfTI file":            "NIfTI (*.nii *.nii.gz);;All files (*)",
+                    "Siemens TWIX (.dat)":   "Siemens TWIX (*.dat);;All files (*)",
+                    "GE P-file (Orchestra)": "GE P-files (P*.7 *.7);;All files (*)"}
+        if src in _filters:
+            p, _ = QFileDialog.getOpenFileName(self, f"Select WASABI {src}", "", _filters[src])
         else:
             p = QFileDialog.getExistingDirectory(self, f"Select WASABI {src}", "")
         if p:
@@ -2452,6 +2517,30 @@ class T1T2Tab(QWidget):
                 freq = self._peek_dicom_freq(path)
                 if freq:
                     self.spin_wasabi_freq.setValue(freq)
+            elif src == "Siemens TWIX (.dat)":
+                # Raw k-space reconstructed in OCEAN (lines/offset from the
+                # timestamps, centre-out reorder, SoS coils); Larmor from header.
+                from my_gui.siemens_twix_reader import read_twix_cest
+                stack, _m0, info = read_twix_cest(path)                # (Y, X, 1, N)
+                image = np.asarray(stack, dtype=float)
+                if off_txt is None:
+                    raise ValueError("TWIX WASABI needs an offsets (.txt, ppm) file.")
+                ppm = off_txt
+                if info.get("larmor_mhz"):
+                    self.spin_wasabi_freq.setValue(float(info["larmor_mhz"]))
+            elif src == "GE P-file (Orchestra)":
+                # Reconstructed by the GE Orchestra SDK in its own env/process.
+                from my_gui.ge_pfile_reader import (read_pfile_cest, is_available,
+                                                    availability_message)
+                if not is_available():
+                    raise RuntimeError(availability_message())
+                stack, _m0, info = read_pfile_cest(path)
+                image = np.asarray(stack, dtype=float)
+                if off_txt is None:
+                    raise ValueError("P-file WASABI needs an offsets (.txt, ppm) file.")
+                ppm = off_txt
+                if info.get("b0_t"):
+                    self.spin_wasabi_freq.setValue(float(info["b0_t"]) * 42.5764)
             else:  # NIfTI
                 import nibabel as nib
                 data = np.asarray(nib.load(path).dataobj, dtype=float)

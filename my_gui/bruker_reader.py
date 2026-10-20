@@ -41,7 +41,19 @@ def read_bruker_params(scan_dir: str | Path, parfile: str, parnames: list[str]) 
         dict  parname -> string value (None if not found)
     """
     param_path = (Path(scan_dir) / ".." / ".." / parfile).resolve()
+    return _parse_param_file(param_path, parnames)
 
+
+def read_visu_params(scan_dir: str | Path, parnames: list[str]) -> dict[str, str | None]:
+    """Like ``read_bruker_params`` for ``pdata/N/visu_pars`` (next to 2dseq).
+    Returns all-None when the file is missing (older data)."""
+    p = Path(scan_dir) / "visu_pars"
+    if not p.is_file():
+        return {name: None for name in parnames}
+    return _parse_param_file(p, parnames)
+
+
+def _parse_param_file(param_path: Path, parnames: list[str]) -> dict[str, str | None]:
     try:
         with open(param_path, "r", errors="replace") as fh:
             lines = fh.readlines()
@@ -148,6 +160,14 @@ def _detect_cest_b1(scan_dir: "str | Path", pv360: bool) -> tuple[float, str]:
         if len(nums) == 0:
             return 0.0
         return float(nums[0])
+
+    # ── Priority 0: custom user methods with a per-frame list (cbd_EPI) ────
+    # CEST_pwrLIST goes with CEST_freqList; the PVM saturation module of such a
+    # method holds an unused default (e.g. 10 µT), so the list wins.
+    if re.search(r"^##\$CEST_freqList=", method_text, re.MULTILINE):
+        val = _extract_key(method_text, "##$CEST_pwrLIST")
+        if 0.0 < val < 50.0:
+            return val, "##$CEST_pwrLIST"
 
     # ── Priority 1 & 2: well-known µT keys ────────────────────────────────
     for key in ("##$Fp_SatPows", "##$PVM_SatTransPulseAmpl_uT"):
@@ -627,6 +647,7 @@ def read_2dseq_cest(scan_dir: str | Path, pv360: bool = False) -> tuple[np.ndarr
     scan_dir = Path(scan_dir)
     nx, ny, nslices, niter = _read_geometry(scan_dir)
     rawdata = _read_raw(scan_dir, nx, ny, nslices, niter)
+    niter = int(rawdata.shape[3])     # _read_raw re-derives the frame count from the file size
 
     # ── Larmor key ────────────────────────────────────────────────────────
     frq_key = "##$PVM_FrqWork"
@@ -646,14 +667,18 @@ def read_2dseq_cest(scan_dir: str | Path, pv360: bool = False) -> tuple[np.ndarr
     #    2. ##$PVM_SatTransPulseAmpl_uT— some non-360 sequences also use this
     #    3. ##$PVM_MagTransPower       — legacy fallback; units may not be µT
     #
+    #  Custom user methods (e.g. <User:cbd_EPI>): ##$CEST_freqList — in Hz
+    #  (one entry per frame, M0 included), tried after the standard keys.
     if pv360:
-        freq_candidates = [("##$PVM_SatTransFreqValues", True)]   # (key, is_ppm)
+        freq_candidates = [("##$PVM_SatTransFreqValues", True),   # (key, is_ppm)
+                           ("##$CEST_freqList", False)]
         pwr_candidates  = ["##$PVM_SatTransPulseAmpl_uT"]
     else:
         freq_candidates = [
             ("##$Fp_SatOffset",    True),   # new style — ppm
             ("##$Fp_SatOffsetHz",  False),  # new style — Hz
             ("##$SatFreqList",     False),  # old style — Hz
+            ("##$CEST_freqList",   False),  # custom user method — Hz
         ]
         pwr_candidates  = [
             "##$Fp_SatPows",               # OCEAN/QUESP seq — already µT  ← first choice
@@ -671,13 +696,16 @@ def read_2dseq_cest(scan_dir: str | Path, pv360: bool = False) -> tuple[np.ndarr
     w_offset    = np.array([], dtype=np.float64)
     freq_is_ppm = False
     freq_key_used = ""
-    for key, is_ppm in freq_candidates:
-        arr = _parse_numbers(satpars.get(key))
-        if len(arr) > 0:
-            w_offset     = arr
-            freq_is_ppm  = is_ppm
-            freq_key_used = key
-            break
+    # A list whose length fits the acquired frames (N, or N−1 + an M0 frame)
+    # beats one that merely exists: custom methods keep an unused one-value
+    # PVM_SatTransFreqValues next to their real per-frame CEST_freqList.
+    _found = [(key, is_ppm, _parse_numbers(satpars.get(key))) for key, is_ppm in freq_candidates]
+    _found = [f for f in _found if len(f[2]) > 0]
+    _fit = [f for f in _found if len(f[2]) in (niter, niter - 1)]
+    for key, is_ppm, arr in (_fit or _found)[:1]:
+        w_offset     = arr
+        freq_is_ppm  = is_ppm
+        freq_key_used = key
 
     # ── Larmor frequency (MHz → used to convert Hz ↔ ppm) ────────────────
     omega_0_arr = _parse_numbers(satpars.get(frq_key))
@@ -719,7 +747,8 @@ def read_2dseq_cest(scan_dir: str | Path, pv360: bool = False) -> tuple[np.ndarr
         w_offset = padded
 
     # ── Convert to ppm ────────────────────────────────────────────────────
-    if freq_is_ppm or pv360:
+    # (no key found → zeros; the PV360 key is ppm, CEST_freqList is Hz)
+    if freq_is_ppm or (pv360 and not freq_key_used):
         w_offset_ppm_raw = w_offset.copy()
         w_offset_hz_raw  = w_offset * omega_0
     else:
@@ -1247,6 +1276,27 @@ def read_2dseq_t2_msme(scan_dir: str | Path, pv360: bool = False) -> tuple[np.nd
         if n_echoes > 0 and te1 > 0:
             tes_ms = np.array([te1 * (i + 1) for i in range(n_echoes)])
 
+    # ── visu_pars: the frame order Bruker actually wrote + the real echo times ──
+    # MSME 2dseq frames are ECHO-fastest ((nTE, FG_ECHO) (nSl, FG_SLICE)); reading
+    # them slice-fastest strings echoes 0,3,6,9 of slice 0,1,2 together for a
+    # 3-slice scan (sawtooth decay).  VisuAcqEchoTime gives the true TEs (e.g.
+    # 12/60/120 ms for PD_T2_MSME, not PVM_EchoTime·k).
+    fg = []
+    te_visu = np.array([])
+    try:
+        vp = read_visu_params(scan_dir, ["##$VisuFGOrderDesc", "##$VisuAcqEchoTime"])
+        import re as _re
+        fg = [(int(n), name) for n, name in
+              _re.findall(r"\(\s*(\d+)\s*,\s*<(\w+)>", vp.get("##$VisuFGOrderDesc") or "")]
+        te_visu = _parse_numbers(_expand_pv360(vp.get("##$VisuAcqEchoTime")))
+    except Exception:
+        fg = []
+    n_te_fg = next((n for n, name in fg if name == "FG_ECHO"), 0)
+    if n_te_fg > 1 and len(te_visu) == n_te_fg and np.all(np.diff(te_visu) > 0):
+        tes_ms = te_visu.astype(float)
+    elif tes_ms is not None and n_te_fg > 1 and len(tes_ms) != n_te_fg and len(te_visu) >= n_te_fg:
+        tes_ms = te_visu[:n_te_fg].astype(float)
+
     if tes_ms is None or len(tes_ms) == 0:
         raise ValueError(
             "Could not read TE values from method file. "
@@ -1254,9 +1304,45 @@ def read_2dseq_t2_msme(scan_dir: str | Path, pv360: bool = False) -> tuple[np.nd
         )
 
     nTE = len(tes_ms)
+    names = [name for _n, name in fg]
+    if fg and "FG_ECHO" in names and dict((nm, n) for n, nm in fg)["FG_ECHO"] == nTE:
+        image = _read_raw_fg(scan_dir, nx, ny, fg, axis_order=("FG_SLICE", "FG_ECHO"))
+        if image is not None:
+            return np.transpose(image, (1, 0, 2, 3)).astype(np.float32), tes_ms
     rawdata = _read_raw(scan_dir, nx, ny, nslices, nTE)
     image = np.transpose(rawdata, (1, 0, 2, 3)).astype(np.float32)
     return image, tes_ms
+
+
+def _read_raw_fg(scan_dir: Path, nx: int, ny: int, fg: list, axis_order=("FG_SLICE", "FG_ECHO")):
+    """Read 2dseq with the frame-group layout from ``VisuFGOrderDesc`` (first
+    group = fastest) and return (nx, ny, n_<axis_order[0]>, n_<axis_order[1]>).
+    Groups not named in ``axis_order`` (e.g. repetitions) keep their first index.
+    Returns None when the file size does not match the frame groups."""
+    import warnings
+    scan_dir = Path(scan_dir)
+    reco_pars = _read_reco_params(scan_dir)
+    dt = _reco_dtype(reco_pars.get("RECO_wordtype"), reco_pars.get("RECO_byte_order"))
+    raw = np.fromfile(str(scan_dir / "2dseq"), dtype=dt)
+    dims = [int(n) for n, _ in fg]
+    n_frames = int(np.prod(dims)) if dims else 1
+    if raw.size != nx * ny * n_frames:
+        return None
+    arr = raw.reshape(nx, ny, *dims, order="F").astype(np.float32)
+    names = [name for _, name in fg]
+    # bring the wanted groups to axes 2, 3 (missing group → length-1 axis)
+    for nm in axis_order:
+        if nm not in names:
+            arr = arr[..., np.newaxis]
+            names.append(nm)
+    src = [2 + names.index(nm) for nm in axis_order]
+    arr = np.moveaxis(arr, src, [2, 3])
+    rest = [nm for nm in names if nm not in axis_order]
+    if rest:
+        warnings.warn(f"2dseq has extra frame groups {rest} — using their first index", stacklevel=3)
+        while arr.ndim > 4:
+            arr = arr[..., 0]
+    return arr
 
 
 def read_2dseq_b1_rare(scan_dir: str | Path, pv360: bool = False) -> np.ndarray:

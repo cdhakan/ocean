@@ -34,6 +34,8 @@ gracefully when it is absent.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 
@@ -255,3 +257,57 @@ def read_twix_cest(path: str, slice_idx: int = 0,
         "notes":           notes,
     }
     return stack, M0, info
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CEST-MRF: .dat → acquired_data.mat (same layout as the Bruker converter)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def twix_output_dir(dat_path: str) -> str:
+    """Folder that receives acquired_data.mat for a .dat: a sibling folder named
+    after the file (``…/meas_MID00054_FID43049_MRF_2/``), mirroring the Bruker
+    scan-folder convention the MRF pipeline expects."""
+    base = os.path.splitext(os.path.basename(dat_path))[0]
+    return os.path.join(os.path.dirname(os.path.abspath(dat_path)), base)
+
+
+def convert_twix_to_acquired_mat(dat_path: str, out_dir: "str | None" = None,
+                                 slice_idx: int = 0,
+                                 lines_per_image: "int | None" = None) -> str:
+    """Reconstruct a Siemens .dat CEST-MRF scan and save ``acquired_data.mat``.
+
+    The file holds ``acquired_data`` as float32 (Y, X, n_slices, n_meas) plus an
+    ``info`` struct (voxel size, FOV, Larmor, matrix, offsets, …) — the same
+    layout ``bruker_reader.save_acquired_data`` writes, so the CEST-MRF tab,
+    the MRF viewer and the dictionary-matching worker consume it unchanged.
+    Returns the absolute path of the written .mat.
+    """
+    from my_gui.bruker_reader import save_acquired_data
+
+    stack, M0, info = read_twix_cest(dat_path, slice_idx=slice_idx,
+                                     lines_per_image=lines_per_image)
+    out_dir = out_dir or twix_output_dir(dat_path)
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _clean(v):
+        """savemat cannot store None inside tuples → use NaN."""
+        if isinstance(v, (tuple, list)):
+            return [np.nan if x is None else x for x in v]
+        return np.nan if v is None else v
+
+    meta = {
+        "source":          info["source"],
+        "dat_path":        os.path.abspath(dat_path),
+        "n_offsets":       info["n_offsets"],
+        "matrix":          list(info["matrix"]),
+        "n_coils":         info["n_coils"],
+        "lines_per_image": info["lines_per_image"],
+        "pe_order":        info["pe_order"],
+        "voxel_mm":        _clean(info.get("voxel_mm")),
+        "fov_mm":          _clean(info.get("fov_mm")),
+        "larmor_mhz":      _clean(info.get("larmor_mhz")),
+        "b0_t":            _clean(info.get("b0_t")),
+        "m0_frame_idx":    info["m0_frame_idx"],
+    }
+    return save_acquired_data(os.path.join(out_dir, "acquired_data"),
+                              stack.astype(np.float32), meta, None, fmt="mat")

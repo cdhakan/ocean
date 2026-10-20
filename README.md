@@ -21,7 +21,7 @@ Get the latest build for your operating system from the **[Releases](../../relea
 - **Inverse‑Z (AREX)** — spillover/MT/T1‑corrected analysis with per‑pool QUESP *f*ₛ / *k*ₛw maps
 - **CEST‑MRF** — Pulseq schedule → Bloch–McConnell dictionary simulation + dot‑product matching
 - **Automation** — phantom detection & brain skull‑stripping; ROI statistics with X–Y agreement plots and box plots; 300‑dpi figure export (PNG/JPEG/TIFF/PDF/SVG)
-- **Vendor support** — Bruker (ParaVision), Siemens & GE (DICOM / NIfTI), Siemens raw data (TWIX `.dat`, reconstructed in-app), MR Solutions (.MRD), MATLAB `.mat` stacks from any vendor
+- **Vendor support** — Bruker (ParaVision), Siemens & GE (DICOM / NIfTI), Siemens raw data (TWIX `.dat`, reconstructed in-app), GE raw data (P-files via the GE Orchestra SDK — in Scan Directory choose Format "GE P-file (Orchestra)" and click **Set up GE Orchestra…** once, pointing it at the SDK folder you obtained from GE; needs conda/Miniforge; the SDK stays in its own Python environment and is never bundled; `bash install_orchestra.sh /path/to/orchestra-sdk` does the same from a terminal), MR Solutions (.MRD), MATLAB `.mat` stacks from any vendor
 
 ## Build from source
 

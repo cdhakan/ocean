@@ -92,6 +92,7 @@ class MainWindow(QMainWindow):
 
         # ScanDirTab → push assigned paths to relevant tabs automatically
         self.scan_dir_tab.scan_assigned.connect(self._on_scan_assigned)
+        self.scan_dir_tab.mrf_converted.connect(self._on_mrf_converted)
         # Let every map tab pull the assigned-scan paths for the "ROIs + Bkg"
         # background-image picker.
         for _mt in (self.results_tab, self.zspec_tab, self.inv_zspec_tab,
@@ -419,6 +420,19 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Dictionary generation complete.", 5000)
 
+    def _on_mrf_converted(self, mat_path: str):
+        """An MRF scan assigned in the Scan Directory has been converted to
+        acquired_data.mat (Bruker 2dseq or Siemens TWIX .dat): load it into
+        the CEST-MRF tab and the MRF viewer."""
+        import os as _os
+        if not mat_path or not _os.path.isfile(mat_path):
+            return
+        if hasattr(self.dict_tab, "_set_acquired_data"):
+            self.dict_tab._set_acquired_data(mat_path, source="scan directory")
+        self.results_tab._data_fn = mat_path
+        self.results_tab._try_load_acquired(mat_path)
+        self.statusBar().showMessage(f"MRF: acquired_data.mat ready → {mat_path}", 6000)
+
     def _on_scan_assigned(self, key: str, path: str):
         """
         Called when ScanDirTab assigns a scan path to a modality.
@@ -438,6 +452,13 @@ class MainWindow(QMainWindow):
                 self.zspec_tab.spin_cest_mrd_mhz.setValue(
                     self.scan_dir_tab.get_mrd_larmor_mhz())
                 self.zspec_tab._load_cest()   # auto-load immediately
+            elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "pfile"
+                  and hasattr(self.zspec_tab, 'edit_cest_pfile')):
+                # GE P-file — reconstructed by the Orchestra SDK (separate env)
+                self.zspec_tab.combo_vendor_cest.setCurrentText("GE P-file (Orchestra)")
+                self.zspec_tab._cest_pfile_path = path
+                self.zspec_tab.edit_cest_pfile.setText(path)
+                self.zspec_tab._load_cest()   # auto-load (ppm needs an offsets .txt)
             elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix"
                   and hasattr(self.zspec_tab, 'edit_cest_twix')):
                 # Siemens TWIX (.dat) — raw k-space reconstructed by OCEAN
@@ -472,6 +493,12 @@ class MainWindow(QMainWindow):
                 self.zspec_tab.spin_wassr_mrd_mhz.setValue(
                     self.scan_dir_tab.get_mrd_larmor_mhz())
                 self.zspec_tab._load_wassr()   # auto-load immediately
+            elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "pfile"
+                  and hasattr(self.zspec_tab, 'edit_wassr_pfile')):
+                self.zspec_tab.combo_vendor_wassr.setCurrentText("GE P-file (Orchestra)")
+                self.zspec_tab._wassr_pfile_path = path
+                self.zspec_tab.edit_wassr_pfile.setText(path)
+                self.zspec_tab._load_wassr()   # auto-load (ppm needs an offsets .txt)
             elif (vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix"
                   and hasattr(self.zspec_tab, 'edit_wassr_twix')):
                 self.zspec_tab.combo_vendor_wassr.setCurrentText("Siemens TWIX (.dat)")
@@ -496,26 +523,47 @@ class MainWindow(QMainWindow):
                 self.zspec_tab.combo_pv_wassr.setCurrentText("PV360" if pv360 else "PV6 / PV7")
                 self.zspec_tab._load_wassr()   # auto-load immediately
 
+        elif key == "wasabi":
+            # WASABI card → T1/T2/B1/WASABI tab: platform (Bruker / GE-Siemens),
+            # PV version and the DICOM-folder vs NIfTI-file source are set from
+            # the path; the fit itself is started by the user (Optimization).
+            if hasattr(self.t1t2_tab, "set_wasabi_scan"):
+                self.t1t2_tab.set_wasabi_scan(path, vendor=vendor, pv360=pv360)
+
         elif key == "mrf":
             # Update DictTab with the assigned MRF scan path
             if hasattr(self.dict_tab, 'set_mrf_scan_path'):
                 self.dict_tab.set_mrf_scan_path(path)
             # Also push any pre-existing acquired_data.mat to the MRF Viewer immediately
+            # (mrf_convert knows where each source type's acquired_data.mat lives)
             import os as _os
-            _acqmat = _os.path.join(path, "acquired_data.mat")
+            from my_gui.mrf_convert import acquired_mat_path_for
+            _acqmat = acquired_mat_path_for(path)
             if _os.path.isfile(_acqmat):
                 self.results_tab._data_fn = _acqmat
                 self.results_tab._try_load_acquired(_acqmat)
 
         elif key == "quesp":
-            # Auto-load QUESP data
+            # Auto-load QUESP data.  GE/Siemens: select the platform and the
+            # auto-detected DICOM / NIfTI format before loading (.mat files are
+            # handled by the QUESP loader itself).
             if hasattr(self.quesp_tab, 'load_from_path'):
+                import os as _os, glob as _glob
+                if vendor == "ge_siemens" and hasattr(self.quesp_tab, "combo_quesp_vendor"):
+                    self.quesp_tab.combo_quesp_vendor.setCurrentIndex(1)
+                    if hasattr(self.quesp_tab, "combo_quesp_gs_format"):
+                        _is_nii = (path.lower().endswith((".nii", ".nii.gz")) or
+                                   (_os.path.isdir(path) and bool(
+                                       _glob.glob(_os.path.join(path, "*.nii*")))))
+                        self.quesp_tab.combo_quesp_gs_format.setCurrentIndex(1 if _is_nii else 0)
+                elif vendor == "bruker" and hasattr(self.quesp_tab, "combo_quesp_vendor"):
+                    self.quesp_tab.combo_quesp_vendor.setCurrentIndex(0)
                 self.quesp_tab.load_from_path(path, pv360=pv360)
 
         elif key == "t1":
-            if vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix":
+            if vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() in ("twix", "pfile"):
                 self.statusBar().showMessage(
-                    "Siemens TWIX (.dat) is supported for CEST / WASSR only — "
+                    "Raw data (Siemens TWIX / GE P-file) is supported for CEST / WASSR / MRF — "
                     "T1 needs DICOM, NIfTI or .mat", 6000)
                 return
             if hasattr(self.t1t2_tab, 'le_t1_dir'):
@@ -537,9 +585,9 @@ class MainWindow(QMainWindow):
                 self.t1t2_tab._load_t1()
 
         elif key == "t2":
-            if vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() == "twix":
+            if vendor == "ge_siemens" and self.scan_dir_tab.get_gs_format() in ("twix", "pfile"):
                 self.statusBar().showMessage(
-                    "Siemens TWIX (.dat) is supported for CEST / WASSR only — "
+                    "Raw data (Siemens TWIX / GE P-file) is supported for CEST / WASSR / MRF — "
                     "T2 needs DICOM, NIfTI or .mat", 6000)
                 return
             if hasattr(self.t1t2_tab, 'le_t2_dir'):

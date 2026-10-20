@@ -484,6 +484,11 @@ class ZSpecTab(QWidget):
         self._wassr_twix_path: str = ""
         self._cest_twix_ppm_path: str = ""
         self._wassr_twix_ppm_path: str = ""
+        # GE P-files (Orchestra) + their offsets .txt
+        self._cest_pfile_path: str = ""
+        self._wassr_pfile_path: str = ""
+        self._cest_pfile_ppm_path: str = ""
+        self._wassr_pfile_ppm_path: str = ""
         # Legacy aliases (kept so any stray reference doesn't crash)
         self._cest_dicom_dir = self._cest_nifti_path = ""
         self._wassr_dicom_dir = self._wassr_nifti_path = ""
@@ -520,7 +525,7 @@ class ZSpecTab(QWidget):
         self.combo_vendor_cest = QComboBox()
         self.combo_vendor_cest.addItems(
             ["Bruker", "GE/Siemens", "MR Solutions", "MATLAB (.mat)",
-             "Siemens TWIX (.dat)"]
+             "Siemens TWIX (.dat)", "GE P-file (Orchestra)"]
         )
         from PyQt6.QtCore import Qt as _Qt
         self.combo_vendor_cest.setItemData(
@@ -627,6 +632,28 @@ class ZSpecTab(QWidget):
         twx_cest_lay.addLayout(tx2)
         self._cest_twix_w.setVisible(False)
         g1.addWidget(self._cest_twix_w)
+
+        # ── GE P-file (Orchestra) — raw GE data reconstructed in a separate env ─
+        self._cest_pfile_w = QWidget()
+        pf_cest_lay = QVBoxLayout(self._cest_pfile_w)
+        pf_cest_lay.setContentsMargins(0, 0, 0, 0)
+        pf_cest_lay.setSpacing(3)
+        pf1 = QHBoxLayout()
+        pf1.addWidget(QLabel("File:"))
+        self.edit_cest_pfile = QLineEdit(); self.edit_cest_pfile.setReadOnly(True)
+        self.edit_cest_pfile.setPlaceholderText("P12345.7 — GE raw data (Orchestra SDK)")
+        pf1.addWidget(self.edit_cest_pfile, stretch=1)
+        _bpf = QPushButton("File…"); _bpf.clicked.connect(self._browse_cest_pfile)
+        pf1.addWidget(_bpf)
+        _bpo = QPushButton("Offsets (.txt)…")
+        _bpo.clicked.connect(lambda: self._browse_pfile_offsets("cest"))
+        pf1.addWidget(_bpo)
+        pf1.addWidget(QLabel("Slice:"))
+        self.spin_cest_pfile_slice = _QSpinBox(); self.spin_cest_pfile_slice.setRange(0, 99)
+        pf1.addWidget(self.spin_cest_pfile_slice)
+        pf_cest_lay.addLayout(pf1)
+        self._cest_pfile_w.setVisible(False)
+        g1.addWidget(self._cest_pfile_w)
 
         # ── MR Solutions (.MRD) — data browse only ─────────────────────────
         self._cest_mrd_w = QWidget()
@@ -761,7 +788,7 @@ class ZSpecTab(QWidget):
         self.combo_vendor_wassr = QComboBox()
         self.combo_vendor_wassr.addItems(
             ["Bruker", "GE/Siemens", "MR Solutions", "MATLAB (.mat)",
-             "Siemens TWIX (.dat)"]
+             "Siemens TWIX (.dat)", "GE P-file (Orchestra)"]
         )
         from PyQt6.QtCore import Qt as _QtW
         self.combo_vendor_wassr.setItemData(
@@ -883,6 +910,28 @@ class ZSpecTab(QWidget):
         twx_wassr_lay.addLayout(tw2)
         self._wassr_twix_w.setVisible(False)
         g2.addWidget(self._wassr_twix_w)
+
+        # ── GE P-file (Orchestra) — WASSR ───────────────────────────────────
+        self._wassr_pfile_w = QWidget()
+        pf_wassr_lay = QVBoxLayout(self._wassr_pfile_w)
+        pf_wassr_lay.setContentsMargins(0, 0, 0, 0)
+        pf_wassr_lay.setSpacing(3)
+        pw1 = QHBoxLayout()
+        pw1.addWidget(QLabel("File:"))
+        self.edit_wassr_pfile = QLineEdit(); self.edit_wassr_pfile.setReadOnly(True)
+        self.edit_wassr_pfile.setPlaceholderText("P12345.7 — GE raw data (Orchestra SDK)")
+        pw1.addWidget(self.edit_wassr_pfile, stretch=1)
+        _bwpf = QPushButton("File…"); _bwpf.clicked.connect(self._browse_wassr_pfile)
+        pw1.addWidget(_bwpf)
+        _bwpo = QPushButton("Offsets (.txt)…")
+        _bwpo.clicked.connect(lambda: self._browse_pfile_offsets("wassr"))
+        pw1.addWidget(_bwpo)
+        pw1.addWidget(QLabel("Slice:"))
+        self.spin_wassr_pfile_slice = _QSpinBoxW(); self.spin_wassr_pfile_slice.setRange(0, 99)
+        pw1.addWidget(self.spin_wassr_pfile_slice)
+        pf_wassr_lay.addLayout(pw1)
+        self._wassr_pfile_w.setVisible(False)
+        g2.addWidget(self._wassr_pfile_w)
 
         # ── MR Solutions (.MRD) sub-widget ─────────────────────────────────
         self._wassr_mrd_w = QWidget()
@@ -1653,6 +1702,8 @@ class ZSpecTab(QWidget):
             self._cest_mat_w.setVisible(v.startswith("MATLAB"))
         if hasattr(self, "_cest_twix_w"):
             self._cest_twix_w.setVisible(v.startswith("Siemens TWIX"))
+        if hasattr(self, "_cest_pfile_w"):
+            self._cest_pfile_w.setVisible(v.startswith("GE P-file"))
         # Mirror the platform choice in the "CEST parameters" dialog sections
         if hasattr(self, "_cest_ge_params_w"):
             self._cest_ge_params_w.setVisible(v.startswith("GE/Siemens"))
@@ -1686,6 +1737,8 @@ class ZSpecTab(QWidget):
             self._wassr_mat_w.setVisible(v.startswith("MATLAB"))
         if hasattr(self, "_wassr_twix_w"):
             self._wassr_twix_w.setVisible(v.startswith("Siemens TWIX"))
+        if hasattr(self, "_wassr_pfile_w"):
+            self._wassr_pfile_w.setVisible(v.startswith("GE P-file"))
 
     # ── public accessors ──────────────────────────────────────────────────
 
@@ -1825,6 +1878,32 @@ class ZSpecTab(QWidget):
             return ppm
         return _load_ppm_sidecar(path, data_path, n_offsets, log_fn)
 
+    # ── GE P-file (Orchestra) browse slots ────────────────────────────────────
+
+    def _browse_cest_pfile(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select CEST GE P-file", "", "GE P-files (P*.7 *.7);;All files (*)")
+        if p:
+            self._cest_pfile_path = p
+            self.edit_cest_pfile.setText(p)
+            self.lbl_cest_info.setText("File selected — pick the offsets (.txt), then 'Load CEST Data'.")
+            self.lbl_cest_info.setStyleSheet(f"font-size: 11px; color: {dc('#555','#888888')};")
+
+    def _browse_wassr_pfile(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select WASSR GE P-file", "", "GE P-files (P*.7 *.7);;All files (*)")
+        if p:
+            self._wassr_pfile_path = p
+            self.edit_wassr_pfile.setText(p)
+
+    def _browse_pfile_offsets(self, which: str):
+        p, _ = QFileDialog.getOpenFileName(
+            self, f"Select {which.upper()} offsets (.txt, ppm)", "",
+            "Text files (*.txt *.csv);;All files (*)")
+        if p:
+            setattr(self, f"_{which}_pfile_ppm_path", p)
+            self._log(f"{which.upper()} P-file offsets file: {p}")
+
     def _browse_cest_ppm(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select CEST offsets file", "",
@@ -1937,6 +2016,8 @@ class ZSpecTab(QWidget):
             self._load_cest_mat()
         elif v.startswith("Siemens TWIX"):
             self._load_cest_twix()
+        elif v.startswith("GE P-file"):
+            self._load_cest_pfile()
         else:
             self._load_cest_ge()
 
@@ -1950,6 +2031,8 @@ class ZSpecTab(QWidget):
             self._load_wassr_mat()
         elif v.startswith("Siemens TWIX"):
             self._load_wassr_twix()
+        elif v.startswith("GE P-file"):
+            self._load_wassr_pfile()
         else:
             self._load_wassr_ge()
 
@@ -2252,6 +2335,61 @@ class ZSpecTab(QWidget):
             self.lbl_wassr_info.setStyleSheet("font-size:11px;color:red;")
             self._log(f"ERROR loading Siemens TWIX WASSR: {exc}")
             import traceback; self._log(traceback.format_exc())
+
+    # ── GE P-file (Orchestra) loaders — reconstruction runs in its own env ───
+
+    def _load_cest_pfile(self):
+        """CEST from a GE P-file: reconstructed by the Orchestra SDK in a separate
+        process/env (my_gui.ge_pfile_reader).  Offsets come from a .txt."""
+        if not self._cest_pfile_path:
+            self._log("Please browse to a CEST P-file first.")
+            return
+        try:
+            from my_gui.ge_pfile_reader import read_pfile_cest, is_available, availability_message
+            if not is_available():
+                raise RuntimeError(availability_message())
+            self._log(f"Reconstructing GE P-file (Orchestra): {self._cest_pfile_path}")
+            QApplication.processEvents()
+            stack, M0, info = read_pfile_cest(self._cest_pfile_path,
+                                              slice_idx=int(self.spin_cest_pfile_slice.value()))
+            n_off = stack.shape[3]
+            if not self._cest_pfile_ppm_path:
+                self._log("  ⚠ no offsets (.txt) chosen — using a sequential index axis.")
+            ppm_all = _load_ppm_sidecar(self._cest_pfile_ppm_path, self._cest_pfile_path,
+                                        n_off, self._log)
+            vx = info.get("voxel_mm") or (None, None, None)
+            _f = lambda v: f"{v:.2f}" if isinstance(v, (int, float)) else "?"
+            self._log(f"  Orchestra recon: {info['matrix'][0]}×{info['matrix'][1]} px, "
+                      f"{n_off} frames ({info['n_phases']} phases × {info['n_echoes']} echoes), "
+                      f"{info['n_coils']} coils, {info['psdname']}, "
+                      f"voxel {_f(vx[0])}×{_f(vx[1])}×{_f(vx[2])} mm  [{info.get('recon_seconds')} s]")
+            _finish_cest_load(self, stack, ppm_all, source="GE P-file (Orchestra)",
+                              m0_override=M0)
+        except Exception as exc:
+            self.lbl_cest_info.setText(f"Error: {exc}")
+            self.lbl_cest_info.setStyleSheet("font-size:11px;color:red;")
+            self._log(f"ERROR loading GE P-file CEST: {exc}")
+
+    def _load_wassr_pfile(self):
+        if not self._wassr_pfile_path:
+            self._log("Please browse to a WASSR P-file first.")
+            return
+        try:
+            from my_gui.ge_pfile_reader import read_pfile_cest, is_available, availability_message
+            if not is_available():
+                raise RuntimeError(availability_message())
+            self._log(f"Reconstructing GE P-file (Orchestra): {self._wassr_pfile_path}")
+            QApplication.processEvents()
+            stack, M0, info = read_pfile_cest(self._wassr_pfile_path,
+                                              slice_idx=int(self.spin_wassr_pfile_slice.value()))
+            ppm_all = _load_ppm_sidecar(self._wassr_pfile_ppm_path, self._wassr_pfile_path,
+                                        stack.shape[3], self._log)
+            _finish_wassr_load(self, stack, ppm_all, source="GE P-file (Orchestra)",
+                               m0_override=M0)
+        except Exception as exc:
+            self.lbl_wassr_info.setText(f"Error: {exc}")
+            self.lbl_wassr_info.setStyleSheet("font-size:11px;color:red;")
+            self._log(f"ERROR loading GE P-file WASSR: {exc}")
 
     def _load_cest_bruker(self):
         if not self._cest_dir:

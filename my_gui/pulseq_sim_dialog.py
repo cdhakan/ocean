@@ -358,8 +358,17 @@ class PulseqSimDialog(QDialog):
             "re-written with the current scanner-limit system settings\n"
             "(grad/slew/RF/ADC timing). Ready to load on a scanner.")
         self.btn_export.clicked.connect(self._export_seq)
+        # Seq Parameter Definitions — edit b0 / b1pa / offsets_ppm / tp / td /
+        # trec … of the selected library sequence and regenerate the .seq
+        self.btn_defs = QPushButton("Seq Parameter Definitions")
+        self.btn_defs.setStyleSheet(
+            "QPushButton{background:#ad1457;color:white;border-radius:4px;padding:6px 16px;font-weight:bold;}"
+            "QPushButton:hover{background:#c2185b;}"
+            f"QPushButton:disabled{{background:{dc('#bbb', '#e6e6e6')};color:{dc('#eee', '#888888')};}}")
+        self.btn_defs.clicked.connect(self._open_seq_definitions)
         actions.addWidget(self.btn_view)
         actions.addWidget(self.btn_sim)
+        actions.addWidget(self.btn_defs)
         actions.addWidget(self.btn_export)
         actions.addSpacing(8)
         actions.addWidget(self._lbl("Readout:"))
@@ -1005,6 +1014,47 @@ class PulseqSimDialog(QDialog):
                 QMessageBox.information(self, "Export complete", f"Exported to:\n{out_path}")
             except Exception as e:                       # noqa: BLE001
                 QMessageBox.critical(self, "Export failed", str(e))
+
+    # ── Seq Parameter Definitions ─────────────────────────────────────────────
+
+    def _open_seq_definitions(self):
+        """Open the definitions editor for the selected .seq; a regenerated file
+        is inserted in the sequence list and selected (View / Simulate / Export
+        then use it)."""
+        if not (self._seq_path and os.path.isfile(self._seq_path)):
+            QMessageBox.information(self, "No sequence", "Select or load a .seq sequence first.")
+            return
+        from my_gui.seq_defs_editor import SeqDefinitionsDialog
+        from my_gui.paths import get_output_dir
+        out_dir = os.path.join(str(get_output_dir()), "pulseq_edited")
+        dlg = SeqDefinitionsDialog(self._seq_path, parent=self, out_dir=out_dir,
+                                   opts_factory=self._make_export_opts, b0_hint=self.sp_b0.value())
+        dlg.applied.connect(self._on_defs_applied)
+        self._defs_dialog = dlg
+        dlg.show()
+
+    def _on_defs_applied(self, path: str, defs: dict):
+        if not os.path.isfile(path):
+            return
+        label = f"(edited)  ·  {os.path.basename(path)}"
+        self.combo_seq.blockSignals(True)
+        idx = next((i for i in range(self.combo_seq.count()) if self.combo_seq.itemData(i) == path), -1)
+        if idx < 0:
+            idx = max(0, self.combo_seq.count() - 1)
+            self.combo_seq.insertItem(idx, label, path)
+        self.combo_seq.setCurrentIndex(idx)
+        self.combo_seq.blockSignals(False)
+        self._seq_path = path
+        self.btn_view.setEnabled(True); self.btn_sim.setEnabled(True)
+        try:                                   # keep the simulation B0 in step with the sequence
+            b0 = float(defs.get("b0", self.sp_b0.value()))
+            if b0 > 0:
+                self.sp_b0.setValue(b0)
+        except (TypeError, ValueError):
+            pass
+        self.lbl_status.setText(f"✓ Regenerated sequence selected: {os.path.basename(path)} — "
+                                "View Sequence / Simulate Dictionary / Export use it now.")
+        self.lbl_status.setStyleSheet("font-size:11px; color:#3aa655; background:transparent;")
 
     def _run_simulation(self):
         if not (self._seq_path and os.path.isfile(self._seq_path)):

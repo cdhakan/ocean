@@ -70,6 +70,29 @@ echo "Verifying bundle structure…"
 ls "${APP_BUNDLE}/Contents/MacOS/" | head -5
 echo "   ✓ Bundle structure looks good."
 
+# Smoke test: start the built app (no window) and make sure it stays up — a
+# missing library or module crashes at launch, and that must never ship.
+echo ""
+echo "Smoke-launching the built app (25 s, no window)…"
+SMOKE_LOG=$(mktemp -t ocean_smoke)
+QT_QPA_PLATFORM=offscreen "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" >"${SMOKE_LOG}" 2>&1 &
+SMOKE_PID=$!
+sleep 25
+if kill -0 "${SMOKE_PID}" 2>/dev/null; then
+    kill "${SMOKE_PID}" 2>/dev/null || true
+    wait "${SMOKE_PID}" 2>/dev/null || true
+    echo "   ✓ App started and stayed up"
+else
+    wait "${SMOKE_PID}" 2>/dev/null || true
+    echo "ERROR: the built app exited during startup — last log lines:"
+    tail -30 "${SMOKE_LOG}"
+    exit 1
+fi
+if grep -qE "Traceback|ModuleNotFoundError|ImportError" "${SMOKE_LOG}"; then
+    echo "WARNING: errors were printed during startup:"
+    grep -nE -A3 "Traceback|ModuleNotFoundError|ImportError" "${SMOKE_LOG}" | head -30
+fi
+
 echo ""
 echo "Creating DMG…"
 

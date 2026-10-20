@@ -514,6 +514,9 @@ class ScanDirTab(QWidget):
 
     # Emitted whenever any modality path changes: (key, abs_path)
     scan_assigned = pyqtSignal(str, str)
+    # Emitted with the acquired_data.mat path once an MRF scan (Bruker 2dseq or
+    # Siemens TWIX .dat) has been converted — app.py loads it into the MRF tab.
+    mrf_converted = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -699,7 +702,7 @@ class ScanDirTab(QWidget):
         gs_fmt_row.addWidget(QLabel("Format:"))
         self.combo_gs_format = QComboBox()
         self.combo_gs_format.addItems(["DICOM (.dcm)", "NIfTI (.nii)", "MATLAB (.mat)",
-                                       "Siemens TWIX (.dat)"])
+                                       "Siemens TWIX (.dat)", "GE P-file (Orchestra)"])
         from PyQt6.QtCore import Qt as _Qt
         self.combo_gs_format.setItemData(
             2,
@@ -708,6 +711,11 @@ class ScanDirTab(QWidget):
             "• plus one vector of N values:  T1 → TR or TI (ms)   T2 → TE (ms)   CEST / WASSR → offsets (ppm)\n"
             "• CEST-MRF viewer: variable 'acquired_data' (Y,X,slices,N)\n"
             "B1, B0 and WASABI maps: use DICOM / NIfTI (not .mat)",
+            _Qt.ItemDataRole.ToolTipRole)
+        self.combo_gs_format.setItemData(
+            4,
+            "GE raw P-files (P12345.7) reconstructed with the GE Orchestra SDK in its own\n"
+            "Python env (run install_orchestra.sh once). CEST / WASSR / MRF cards.",
             _Qt.ItemDataRole.ToolTipRole)
         self.combo_gs_format.setFixedWidth(150)
         self.combo_gs_format.setToolTip(
@@ -728,6 +736,22 @@ class ScanDirTab(QWidget):
         )
         self.btn_gs_detect.clicked.connect(self._refresh_gs_info)
         gs_fmt_row.addWidget(self.btn_gs_detect)
+        # One-time GE Orchestra setup — shown only for the P-file format while
+        # the SDK env is missing; becomes a "ready" label afterwards.
+        self.btn_orchestra_setup = QPushButton("Set up GE Orchestra…")
+        self.btn_orchestra_setup.setFixedHeight(26)
+        self.btn_orchestra_setup.setStyleSheet(
+            "QPushButton { background: #6a1b9a; color: white; border: none; "
+            "border-radius: 4px; padding: 2px 10px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #8e24aa; }"
+        )
+        self.btn_orchestra_setup.clicked.connect(self._setup_orchestra_clicked)
+        self.btn_orchestra_setup.setVisible(False)
+        gs_fmt_row.addWidget(self.btn_orchestra_setup)
+        self.lbl_orchestra_state = QLabel("")
+        self.lbl_orchestra_state.setStyleSheet("font-size: 11px; color: #4ec9b0;")
+        self.lbl_orchestra_state.setVisible(False)
+        gs_fmt_row.addWidget(self.lbl_orchestra_state)
         gs_fmt_row.addStretch()
         gs_root_lay.addLayout(gs_fmt_row)
 
@@ -890,7 +914,7 @@ class ScanDirTab(QWidget):
         """Return 'dicom', 'nifti' or 'mat' (only meaningful when vendor is
         GE/Siemens).  'mat' is vendor-neutral — a Bruker, GE or Siemens export
         loads identically through my_gui.mat_reader."""
-        return {0: "dicom", 1: "nifti", 2: "mat", 3: "twix"}.get(
+        return {0: "dicom", 1: "nifti", 2: "mat", 3: "twix", 4: "pfile"}.get(
             self.combo_gs_format.currentIndex(), "dicom")
 
     def _apply_card_file_mode(self):
@@ -901,10 +925,10 @@ class ScanDirTab(QWidget):
         if idx == 2:
             for c in cards:
                 c.set_file_mode(True, "MR Solutions raw (*.MRD *.mrd);;All files (*)")
-        elif idx == 1 and self.get_gs_format() in ("mat", "twix"):
-            flt = ("MATLAB files (*.mat);;All files (*)"
-                   if self.get_gs_format() == "mat"
-                   else "Siemens TWIX (*.dat);;All files (*)")
+        elif idx == 1 and self.get_gs_format() in ("mat", "twix", "pfile"):
+            flt = {"mat":   "MATLAB files (*.mat);;All files (*)",
+                   "twix":  "Siemens TWIX (*.dat);;All files (*)",
+                   "pfile": "GE P-files (P*.7 *.7);;All files (*)"}[self.get_gs_format()]
             for c in cards:
                 c.set_file_mode(True, flt)
         else:
@@ -912,12 +936,92 @@ class ScanDirTab(QWidget):
                 c.set_file_mode(False)
 
     def _on_gs_format_changed(self, idx: int):
-        """DICOM / NIfTI / MATLAB / TWIX switch on the GE-Siemens page.  If a
-        study folder is already chosen, re-detect with the new format so the
-        preview list and the card dropdowns follow the selection."""
+        """DICOM / NIfTI / MATLAB / TWIX / P-file switch on the GE-Siemens page.
+        If a study folder is already chosen, re-detect with the new format so
+        the preview list and the card dropdowns follow the selection."""
         self._apply_card_file_mode()
+        self._update_orchestra_button()
         if getattr(self, "_gs_study_dir", "") and hasattr(self, "lst_gs_scans"):
             self._refresh_gs_info()
+
+    # ── GE Orchestra one-click setup ─────────────────────────────────────────
+
+    def _update_orchestra_button(self):
+        """Show the setup button only for the P-file format while Orchestra is
+        not available; show a 'ready' label once it is."""
+        if not hasattr(self, "btn_orchestra_setup"):
+            return
+        is_pfile = self.get_gs_format() == "pfile"
+        try:
+            from my_gui.ge_pfile_reader import is_available
+            ready = is_available()
+        except Exception:
+            ready = False
+        self.btn_orchestra_setup.setVisible(is_pfile and not ready)
+        self.lbl_orchestra_state.setText("✓ GE Orchestra ready" if ready else "")
+        self.lbl_orchestra_state.setVisible(is_pfile and ready)
+
+    def _setup_orchestra_clicked(self):
+        """Pick the GE Orchestra SDK folder, then create the isolated env in a
+        background thread with a live log (creating the env takes minutes)."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QPlainTextEdit, QPushButton,
+                                     QMessageBox)
+        from PyQt6.QtCore import QThread, pyqtSignal as _sig, QObject
+        start = os.path.join(os.path.expanduser("~"), "Downloads")
+        sdk = QFileDialog.getExistingDirectory(
+            self, "Select the GE Orchestra SDK folder (orchestra-sdk-*.python)",
+            start if os.path.isdir(start) else "")
+        if not sdk:
+            return
+        from my_gui.ge_pfile_reader import _has_lib
+        if not _has_lib(sdk):
+            QMessageBox.warning(self, "Not an Orchestra SDK folder",
+                                "No GERecon library (GERecon.so.mac / GERecon.so / GERecon.pyd) "
+                                "was found in that folder.\nPick the orchestra-sdk-*.python "
+                                "folder you obtained from GE.")
+            return
+
+        class _Setup(QObject):
+            line = _sig(str)
+            done = _sig(bool, str)
+
+            def __init__(s, sdk_dir):
+                super().__init__(); s._sdk = sdk_dir
+
+            def run(s):
+                try:
+                    from my_gui.ge_pfile_reader import setup_orchestra
+                    py, _ = setup_orchestra(s._sdk, log_cb=s.line.emit)
+                    s.done.emit(True, f"GE Orchestra ready — env python: {py}")
+                except Exception as exc:
+                    s.done.emit(False, str(exc))
+
+        dlg = QDialog(self); dlg.setWindowTitle("GE Orchestra setup"); dlg.resize(720, 420)
+        v = QVBoxLayout(dlg)
+        log = QPlainTextEdit(); log.setReadOnly(True); v.addWidget(log)
+        btn_close = QPushButton("Close"); btn_close.setEnabled(False)
+        btn_close.clicked.connect(dlg.accept); v.addWidget(btn_close)
+        log.appendPlainText(f"SDK folder: {sdk}")
+
+        thread = QThread(self); worker = _Setup(sdk); worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.line.connect(log.appendPlainText)
+
+        def _finished(ok, msg):
+            thread.quit()
+            log.appendPlainText(("✔ " if ok else "✖ ") + msg)
+            btn_close.setEnabled(True)
+            self.btn_orchestra_setup.setEnabled(True)
+            self.btn_orchestra_setup.setText("Set up GE Orchestra…")
+            self._update_orchestra_button()
+            if ok and getattr(self, "_gs_study_dir", ""):
+                self._refresh_gs_info()
+        worker.done.connect(_finished)
+        self._orchestra_thread, self._orchestra_worker = thread, worker   # keep alive
+        self.btn_orchestra_setup.setEnabled(False)                        # one run at a time
+        self.btn_orchestra_setup.setText("Setting up GE Orchestra…")
+        thread.start()
+        dlg.show()
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
@@ -1007,12 +1111,13 @@ class ScanDirTab(QWidget):
         fmt = self.get_gs_format()
         self._gs_files = []
 
-        if fmt in ("mat", "twix"):
-            # Single-file formats — list every .mat / .dat (recursively) in the
-            # preview list and offer them in each modality card's dropdown,
-            # exactly like the MR Solutions page does for .MRD files.
-            pat = "*.mat" if fmt == "mat" else "*.dat"
+        if fmt in ("mat", "twix", "pfile"):
+            # Single-file formats — list every .mat / .dat / P*.7 (recursively)
+            # in the preview list and offer them in each modality card's
+            # dropdown, exactly like the MR Solutions page does for .MRD files.
+            pats = {"mat": ("*.mat",), "twix": ("*.dat",), "pfile": ("P*.7", "p*.7")}[fmt]
             files = sorted(set(
+                f for pat in pats for f in
                 _glob.glob(os.path.join(path, pat)) +
                 _glob.glob(os.path.join(path, "**", pat), recursive=True)
             ))
@@ -1202,7 +1307,7 @@ class ScanDirTab(QWidget):
         self.lst_gs_scans.clear()
         self._gs_series = []
         self._gs_files = list(files)
-        ext = ".mat" if fmt == "mat" else ".dat"
+        ext = {"mat": ".mat", "twix": ".dat", "pfile": "P*.7"}.get(fmt, ".dat")
         for f in files:
             try:
                 size_mb = os.path.getsize(f) / 1e6
@@ -1219,7 +1324,8 @@ class ScanDirTab(QWidget):
             self.lst_gs_scans.addItem(item)
         self._populate_gs_cards()
         if files:
-            what = ("T1 / T2 / CEST / WASSR" if fmt == "mat" else "CEST / WASSR")
+            what = {"mat": "T1 / T2 / CEST / WASSR", "twix": "CEST / WASSR / MRF",
+                    "pfile": "CEST / WASSR / MRF"}.get(fmt, "CEST / WASSR")
             self.lbl_gs_info.setText(
                 f"{len(files)} {ext} file(s) found — assign {what} in the cards below.")
             self.lbl_gs_info.setStyleSheet("font-size: 11px; color: #4ec9b0;")
@@ -1362,6 +1468,9 @@ class ScanDirTab(QWidget):
                 extra = self._twix_quick_info(f)
                 if extra:
                     detail += "   |   " + extra
+            elif f.lower().endswith(".7"):
+                from my_gui.ge_pfile_reader import availability_message
+                detail += "   |   " + availability_message()
             self.lbl_gs_scan_detail.setText(detail)
             return
         if row < 0 or row >= len(self._gs_series):
@@ -1493,7 +1602,10 @@ class ScanDirTab(QWidget):
 
         # ── MRF: auto-check / auto-convert acquired_data.mat ──────────────
         if key == "mrf" and path:
-            mat_path = os.path.join(path, "acquired_data.mat")
+            # Bruker folder, Siemens TWIX .dat, DICOM / NIfTI folder or file, or
+            # a .mat — mrf_convert decides where acquired_data.mat lives.
+            from my_gui.mrf_convert import acquired_mat_path_for
+            mat_path = acquired_mat_path_for(path)
             if os.path.isfile(mat_path):
                 self.lbl_summary.setStyleSheet(
                     "background: #1e2a1e; color: #4ec9b0; border-radius: 6px; "
@@ -1503,8 +1615,9 @@ class ScanDirTab(QWidget):
                     self.lbl_summary.text() +
                     "   ✔ MRF: acquired_data.mat already exists"
                 )
+                self.mrf_converted.emit(mat_path)
             else:
-                # Auto-convert 2dseq → acquired_data.mat in background thread
+                # Auto-convert (2dseq or TWIX) → acquired_data.mat in a thread
                 self._auto_convert_mrf(path)
 
     def _auto_convert_mrf(self, path: str):
@@ -1522,19 +1635,16 @@ class ScanDirTab(QWidget):
 
             def run(self):
                 try:
-                    from my_gui.bruker_reader import read_2dseq_mrf, save_acquired_data
-                    acq, info, seq = read_2dseq_mrf(self._path, pv360=self._pv360)
-                    saved = save_acquired_data(
-                        os.path.join(self._path, "acquired_data"),
-                        acq, info, seq, fmt="mat"
-                    )
+                    # Bruker 2dseq, Siemens TWIX .dat, DICOM / NIfTI, or .mat
+                    from my_gui.mrf_convert import convert_to_acquired_mat
+                    saved = convert_to_acquired_mat(self._path, pv360=self._pv360)
                     self.done.emit(saved)
                 except Exception as exc:
                     self.error.emit(str(exc))
 
         # Indicate conversion in progress
         cur = self.lbl_summary.text()
-        self.lbl_summary.setText(cur + "   ⏳ Converting MRF 2dseq → .mat…")
+        self.lbl_summary.setText(cur + "   ⏳ Converting MRF raw data → acquired_data.mat…")
         self.lbl_summary.setStyleSheet(
             "background: #1e2a1e; color: #f0c040; border-radius: 6px; "
             "padding: 6px 12px; font-size: 12px;"
@@ -1548,7 +1658,8 @@ class ScanDirTab(QWidget):
 
         def _on_done(saved):
             thread.quit()
-            cur2 = self.lbl_summary.text().replace("⏳ Converting MRF 2dseq → .mat…", "")
+            self.mrf_converted.emit(saved)
+            cur2 = self.lbl_summary.text().replace("⏳ Converting MRF raw data → acquired_data.mat…", "")
             self.lbl_summary.setText(cur2.rstrip() + "   ✔ MRF: acquired_data.mat saved")
             self.lbl_summary.setStyleSheet(
                 "background: #1e2a1e; color: #4ec9b0; border-radius: 6px; "
@@ -1557,7 +1668,7 @@ class ScanDirTab(QWidget):
 
         def _on_error(msg):
             thread.quit()
-            cur2 = self.lbl_summary.text().replace("⏳ Converting MRF 2dseq → .mat…", "")
+            cur2 = self.lbl_summary.text().replace("⏳ Converting MRF raw data → acquired_data.mat…", "")
             self.lbl_summary.setText(cur2.rstrip() + f"   ✖ MRF convert error: {msg[:60]}")
             self.lbl_summary.setStyleSheet(
                 "background: #2a1e1e; color: #e74c3c; border-radius: 6px; "

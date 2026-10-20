@@ -102,6 +102,22 @@ class ROITab(QWidget):
         self.le_ref_dir.setText(title)
         self.canvas.show_map(self._ref_img, title, cmap="gray")
 
+    def _toggle_hide_rois(self, checked: bool):
+        """Hide / show the ROI overlays (outlines and fills) on the image; the
+        ROIs stay in the list and in every analysis.  Keeps the current
+        window/level and the black-background setting."""
+        want_visible = not checked
+        if getattr(self.canvas, "_rois_visible", True) != want_visible:
+            self.canvas.toggle_rois_visible()
+            if getattr(self.canvas, "_dark_bg", False):
+                try:
+                    from my_gui.fig_theme import apply_fig_dark_theme
+                    apply_fig_dark_theme(self.canvas._fig, True)
+                    self.canvas.draw_idle()
+                except Exception:
+                    pass
+        self.btn_hide_rois.setText("Show ROIs" if checked else "Hide ROIs")
+
     def _on_dark_bg_toggled(self, checked: bool):
         """Flip the canvas black-background theme and re-render the reference."""
         self.canvas._dark_bg = bool(checked)
@@ -166,6 +182,12 @@ class ROITab(QWidget):
             "surround and labels flip — the maps stay identical.")
         self.chk_dark_bg.toggled.connect(self._on_dark_bg_toggled)
         _tool_row.addWidget(self.chk_dark_bg)
+
+        # Hide / show every ROI overlay on the image (the ROIs themselves stay)
+        self.btn_hide_rois = QPushButton("Hide ROIs")
+        self.btn_hide_rois.setCheckable(True)
+        self.btn_hide_rois.clicked.connect(self._toggle_hide_rois)
+        _tool_row.addWidget(self.btn_hide_rois)
 
         _tool_row.addStretch()
         right_l.addLayout(_tool_row)

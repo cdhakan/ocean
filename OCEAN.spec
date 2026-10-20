@@ -127,6 +127,10 @@ datas = [
     *collect_data_files("PyQt6"),
 
     *_pypulseq_datas,
+
+    # GE P-file reconstruction runs OUT-OF-PROCESS in the user's Orchestra env
+    # (install_orchestra.sh); the worker script must exist as a plain file.
+    (str(ROOT / "my_gui" / "orchestra_worker.py"), "my_gui"),
 ]
 
 if CEST_LIB.exists():
@@ -186,7 +190,34 @@ if not os.environ.get("OCEAN_NO_DCM2NIIX"):
         else:
             print(f"[spec] dcm2niix binary not found at {_d2n_bin}")
     except Exception as _d2n_err:
-        print(f"[spec] dcm2niix NOT bundled (DICOM-folder loading limited): {_d2n_err}")
+        # Fallback (local Mac build): the package may live in ANOTHER env (e.g.
+        # base miniforge) with only a launcher script on PATH.  Use
+        # $OCEAN_DCM2NIIX, or the real binary behind that launcher.
+        import glob as _glob, shutil as _shutil
+        _cands = [os.environ.get("OCEAN_DCM2NIIX", "")]
+        _w = _shutil.which("dcm2niix")
+        if _w:
+            _cands.append(_w)
+            _root = Path(_w).resolve().parent.parent          # <env>/bin/dcm2niix → <env>
+            _cands += sorted(_glob.glob(str(_root / "lib" / "python3*" / "site-packages" / "dcm2niix" / "dcm2niix")))
+        # an activated build env hides base's bin/ — also look in the usual conda roots
+        for _cr in ("miniforge3_default", "miniforge3", "miniconda3", "anaconda3", "mambaforge"):
+            _base = Path.home() / _cr
+            _cands += sorted(_glob.glob(str(_base / "lib" / "python3*" / "site-packages" / "dcm2niix" / "dcm2niix")))
+            _cands += sorted(_glob.glob(str(_base / "envs" / "*" / "lib" / "python3*" / "site-packages" / "dcm2niix" / "dcm2niix")))
+        _d2n_bin = None
+        for _c in _cands:
+            if _c and os.path.isfile(_c) and os.access(_c, os.X_OK):
+                with open(_c, "rb") as _fh:
+                    _magic = _fh.read(4)
+                if _magic[:2] != b"#!":                     # a real executable, not a launcher script
+                    _d2n_bin = _c
+                    break
+        if _d2n_bin:
+            binaries.append((_d2n_bin, "."))
+            print(f"[spec] bundling dcm2niix (found outside the build env): {_d2n_bin}")
+        else:
+            print(f"[spec] dcm2niix NOT bundled (DICOM-folder loading limited): {_d2n_err}")
 
 # ── BM3D / BM4D denoising (optional `bm3d` package) ──────────────────────────
 # bm4d ships ONE C library per platform (libbm4d_mac_arm.so, libbm4d_mac.so,
