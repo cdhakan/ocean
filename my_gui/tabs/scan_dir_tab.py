@@ -700,6 +700,15 @@ class ScanDirTab(QWidget):
         self.combo_gs_format = QComboBox()
         self.combo_gs_format.addItems(["DICOM (.dcm)", "NIfTI (.nii)", "MATLAB (.mat)",
                                        "Siemens TWIX (.dat)"])
+        from PyQt6.QtCore import Qt as _Qt
+        self.combo_gs_format.setItemData(
+            2,
+            "MATLAB .mat — one file per scan, any variable names:\n"
+            "• image: (Y,X,N) single slice  or  (Y,X,slices,N) multi-slice; N = measurements\n"
+            "• plus one vector of N values:  T1 → TR or TI (ms)   T2 → TE (ms)   CEST / WASSR → offsets (ppm)\n"
+            "• CEST-MRF viewer: variable 'acquired_data' (Y,X,slices,N)\n"
+            "B1, B0 and WASABI maps: use DICOM / NIfTI (not .mat)",
+            _Qt.ItemDataRole.ToolTipRole)
         self.combo_gs_format.setFixedWidth(150)
         self.combo_gs_format.setToolTip(
             "DICOM: folder contains .dcm files (one per TR/TE/offset).\n"
@@ -759,6 +768,8 @@ class ScanDirTab(QWidget):
         self._gs_scan_dirs: list[str] = []
         # Detected series: list of dict(dir, num, desc, n, tags) — one per series
         self._gs_series: list[dict] = []
+        # Single-file formats (MATLAB .mat / Siemens TWIX .dat): detected files
+        self._gs_files: list[str] = []
 
         self._dir_stack.addWidget(gs_page)       # index 1
 
@@ -901,8 +912,12 @@ class ScanDirTab(QWidget):
                 c.set_file_mode(False)
 
     def _on_gs_format_changed(self, idx: int):
-        """DICOM / NIfTI / MATLAB / TWIX switch on the GE-Siemens page."""
+        """DICOM / NIfTI / MATLAB / TWIX switch on the GE-Siemens page.  If a
+        study folder is already chosen, re-detect with the new format so the
+        preview list and the card dropdowns follow the selection."""
         self._apply_card_file_mode()
+        if getattr(self, "_gs_study_dir", "") and hasattr(self, "lst_gs_scans"):
+            self._refresh_gs_info()
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
@@ -915,8 +930,8 @@ class ScanDirTab(QWidget):
         self._apply_card_file_mode()
         if mrd_mode:
             self._refresh_mrd_files()
-        elif idx == 1 and self._gs_series:
-            # GE/Siemens — restore the detected-series dropdowns on the cards
+        elif idx == 1 and (self._gs_series or self._gs_files):
+            # GE/Siemens — restore the detected series / file dropdowns on the cards
             self._populate_gs_cards()
         elif idx == 0 and getattr(self, "_scan_entries", None):
             # Bruker — restore the scan-number dropdowns
@@ -962,7 +977,7 @@ class ScanDirTab(QWidget):
     def _browse_gs_study(self):
         """Browse a GE / Siemens data folder and auto-detect scanner info."""
         d = QFileDialog.getExistingDirectory(
-            self, "Select GE / Siemens data folder (containing DICOM or NIfTI files)", ""
+            self, "Select GE / Siemens data folder (DICOM, NIfTI, .mat or Siemens .dat files)", ""
         )
         if not d:
             return
@@ -990,6 +1005,19 @@ class ScanDirTab(QWidget):
 
         import glob as _glob
         fmt = self.get_gs_format()
+        self._gs_files = []
+
+        if fmt in ("mat", "twix"):
+            # Single-file formats — list every .mat / .dat (recursively) in the
+            # preview list and offer them in each modality card's dropdown,
+            # exactly like the MR Solutions page does for .MRD files.
+            pat = "*.mat" if fmt == "mat" else "*.dat"
+            files = sorted(set(
+                _glob.glob(os.path.join(path, pat)) +
+                _glob.glob(os.path.join(path, "**", pat), recursive=True)
+            ))
+            self._build_gs_file_list(files, fmt)
+            return
 
         if fmt == "nifti":
             # NIfTI mode — just list .nii files
@@ -1038,6 +1066,8 @@ class ScanDirTab(QWidget):
             )
             self.lbl_gs_info.setStyleSheet("font-size: 11px; color: orange;")
             self.lst_gs_scans.clear()
+            self._gs_series = []
+            self._populate_gs_cards()      # drop any stale series / file dropdowns
             self._gs_series = []
             return
 
@@ -1165,8 +1195,105 @@ class ScanDirTab(QWidget):
 
         self._populate_gs_cards()
 
+    def _build_gs_file_list(self, files: list, fmt: str):
+        """Preview list + card dropdowns for the single-file formats
+        (MATLAB .mat / Siemens TWIX .dat)."""
+        from PyQt6.QtWidgets import QListWidgetItem
+        self.lst_gs_scans.clear()
+        self._gs_series = []
+        self._gs_files = list(files)
+        ext = ".mat" if fmt == "mat" else ".dat"
+        for f in files:
+            try:
+                size_mb = os.path.getsize(f) / 1e6
+                size_s = f"{size_mb:,.0f} MB" if size_mb >= 10 else f"{size_mb:.1f} MB"
+            except OSError:
+                size_s = "?"
+            item = QListWidgetItem(f"  {os.path.basename(f)}   ·   {size_s}")
+            item.setFont(QFont("Arial", 12))
+            self.lst_gs_scans.addItem(item)
+        if not files:
+            item = QListWidgetItem(f"  (no {ext} files found)")
+            item.setFont(QFont("Arial", 11))
+            item.setForeground(QColor("#666"))
+            self.lst_gs_scans.addItem(item)
+        self._populate_gs_cards()
+        if files:
+            what = ("T1 / T2 / CEST / WASSR" if fmt == "mat" else "CEST / WASSR")
+            self.lbl_gs_info.setText(
+                f"{len(files)} {ext} file(s) found — assign {what} in the cards below.")
+            self.lbl_gs_info.setStyleSheet("font-size: 11px; color: #4ec9b0;")
+        else:
+            self.lbl_gs_info.setText(f"No {ext} files found in the selected folder.")
+            self.lbl_gs_info.setStyleSheet("font-size: 11px; color: orange;")
+
+    def _twix_quick_info(self, path: str) -> str:
+        """One-line summary of a Siemens .dat from its header only (no k-space
+        read): protocol name, saturation blocks × lines, coils.  Cached."""
+        cache = getattr(self, "_twix_info_cache", None)
+        if cache is None:
+            cache = self._twix_info_cache = {}
+        if path in cache:
+            return cache[path]
+        info = ""
+        try:
+            from my_gui.siemens_twix_reader import (is_available, _timestamp_blocks,
+                                                    _phase_encode_lines)
+            if is_available():
+                import twixtools
+                tw = twixtools.map_twix(path, verbose=False)
+                meas = tw[-1]
+                hdr = meas.get("hdr", {}) or {}
+                prot = ""
+                for sec in ("Meas", "Config", "Dicom", "Phoenix", "MeasYaps"):
+                    d = hdr.get(sec, {}) or {}
+                    prot = d.get("tProtocolName") or d.get("ProtocolName") or ""
+                    if prot:
+                        break
+                im = meas["image"]
+                dims = list(im.dims)
+                npe, nblk = _timestamp_blocks(getattr(im, "mdb_list", []))
+                bits = []
+                if prot:
+                    bits.append(f"protocol {prot}")
+                if npe and nblk:
+                    bits.append(f"{nblk} offsets × {npe} lines")
+                elif "Lin" in dims:
+                    bits.append(f"{im.shape[dims.index('Lin')]} lines "
+                                f"(header nPE {_phase_encode_lines(hdr) or '?'})")
+                if "Cha" in dims:
+                    bits.append(f"{im.shape[dims.index('Cha')]} coils")
+                # FOV / thickness from the header are reliable; the in-plane
+                # matrix is lines-per-offset × (readout samples / oversampling).
+                try:
+                    s0 = hdr["MeasYaps"]["sSliceArray"]["asSlice"][0]
+                    fx, fy, th = (float(s0["dReadoutFOV"]), float(s0["dPhaseFOV"]),
+                                  float(s0["dThickness"]))
+                    os_f = float((hdr.get("Meas", {}) or {}).get("flReadoutOSFactor") or 2.0)
+                    ncol = (int(im.shape[dims.index("Col")] / os_f)
+                            if "Col" in dims else None)
+                    if npe and ncol:
+                        bits.append(f"FOV {fx:g}×{fy:g} mm → voxel "
+                                    f"{fx / ncol:.2f}×{fy / npe:.2f}×{th:g} mm")
+                    else:
+                        bits.append(f"FOV {fx:g}×{fy:g} mm, slice {th:g} mm")
+                except Exception:
+                    pass
+                info = "   |   ".join(bits)
+            else:
+                info = "(twixtools not installed — header not read)"
+        except Exception as exc:
+            info = f"(TWIX header not readable: {exc})"
+        cache[path] = info
+        return info
+
     def _populate_gs_cards(self):
-        """Push the detected GE/Siemens series into every modality-card dropdown."""
+        """Push the detected GE/Siemens series — or, for the single-file formats,
+        the detected .mat / .dat files — into every modality-card dropdown."""
+        if self._gs_files and self.get_gs_format() in ("mat", "twix"):
+            for card in self._cards.values():
+                card.populate_files(self._gs_files, self._gs_study_dir)
+            return
         entries = [(f"{s['num']}  ·  {s['desc']}  ({s['n']})", s['dir'])
                    for s in self._gs_series]
         for card in self._cards.values():
@@ -1223,7 +1350,20 @@ class ScanDirTab(QWidget):
         return d
 
     def _on_gs_scanlist_row_changed(self, row: int):
-        """Show the full DICOM tag set for the selected series."""
+        """Show the full DICOM tag set for the selected series — or, for the
+        single-file formats, the file path/size (+ TWIX header summary)."""
+        if self._gs_files:
+            if row < 0 or row >= len(self._gs_files):
+                self.lbl_gs_scan_detail.setText("")
+                return
+            f = self._gs_files[row]
+            detail = f"Path: {f}"
+            if f.lower().endswith(".dat"):
+                extra = self._twix_quick_info(f)
+                if extra:
+                    detail += "   |   " + extra
+            self.lbl_gs_scan_detail.setText(detail)
+            return
         if row < 0 or row >= len(self._gs_series):
             self.lbl_gs_scan_detail.setText("")
             return

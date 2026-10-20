@@ -758,6 +758,12 @@ class T1T2Tab(QWidget):
         fmt_row.addWidget(QLabel("Platform:"))
         self.combo_t1_fmt = QComboBox()
         self.combo_t1_fmt.addItems(["Bruker", "GE/Siemens", "MATLAB (.mat)"])
+        from PyQt6.QtCore import Qt as _Qt
+        self.combo_t1_fmt.setItemData(
+            2,
+            "MATLAB .mat (any variable names): image (Y,X,N) or (Y,X,slices,N)\n"
+            "+ a vector of N TR (variable TR) or TI (inversion recovery) values in ms",
+            _Qt.ItemDataRole.ToolTipRole)
         self.combo_t1_fmt.currentIndexChanged.connect(self._on_t1_fmt_changed)
         fmt_row.addWidget(self.combo_t1_fmt, stretch=1)
         fmt_row.addWidget(QLabel("Model:"))
@@ -855,6 +861,12 @@ class T1T2Tab(QWidget):
         fmt_row.addWidget(QLabel("Platform:"))
         self.combo_t2_fmt = QComboBox()
         self.combo_t2_fmt.addItems(["Bruker", "GE/Siemens", "MATLAB (.mat)"])
+        from PyQt6.QtCore import Qt as _Qt2
+        self.combo_t2_fmt.setItemData(
+            2,
+            "MATLAB .mat (any variable names): image (Y,X,N) or (Y,X,slices,N)\n"
+            "+ a vector of N echo times TE in ms",
+            _Qt2.ItemDataRole.ToolTipRole)
         self.combo_t2_fmt.currentIndexChanged.connect(self._on_t2_fmt_changed)
         fmt_row.addWidget(self.combo_t2_fmt, stretch=1)
         layout.addLayout(fmt_row)

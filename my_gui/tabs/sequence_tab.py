@@ -65,6 +65,12 @@ _COL_SLFA  = 6
 # .txt parser  (mirrors MATLAB logic exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Which [DEFINITIONS] names the last _rows_from_seq_defs() call resolved each
+# schedule column from (role -> key), e.g. {"B1": "MRF_B1_uT", ...}.  Shown in
+# the "Loaded" label so a user can see when a file used unexpected names.
+_SEQ_DEFS_LAST_USED: dict = {}
+
+
 def _parse_seq_definitions(filepath: str) -> dict:
     """Read the [DEFINITIONS] block of a Pulseq .seq file as a plain dict.
 
@@ -1348,37 +1354,117 @@ class SequenceTab(QWidget):
             except (TypeError, ValueError):
                 return default
 
-        per = {k: _lst(seq_defs.get(k, [])) for k in
-               ("tp", "Trec", "B1pa", "excFA", "SLFA", "SLflag", "offsets_ppm")}
+        # Definition names differ between writers.  pulseq-CEST / OCEAN's own
+        # writer: B1pa, Trec, tp, excFA, SLflag, SLFA, n_pulses, td.  MATLAB
+        # CEST-MRF writers (e.g. CEST_GRE_3T_CIMAX_MRF.seq): MRF_B1_uT,
+        # MRF_ActualTR_s / MRF_RequestedTR_s (the FULL TR, seconds),
+        # MRF_Tsat_s (total saturation time), MRF_ScheduleFA_deg,
+        # MRF_NumSatPulses.  First present name wins; ``used`` records which.
+        # A third style is the pulseq-CEST library's MT-MRF files: B1,
+        # PulseOffsetPPM, RepetitionTimes, numSatPulses, PulseDuration.
+        _ALIASES = {
+            "B1":     ("B1pa", "MRF_B1_uT", "B1_uT", "b1_uT", "satpwr_uT", "B1"),
+            "TR_s":   ("MRF_ActualTR_s", "MRF_RequestedTR_s", "TR_s",
+                       "RepetitionTimes"),
+            "Trec":   ("Trec",),
+            "Tsat_s": ("MRF_Tsat_s", "Tsat_s", "tsat_s", "Tsat"),
+            "tp":     ("tp", "PulseDuration"),
+            "FA":     ("excFA", "MRF_ScheduleFA_deg", "FA_deg", "excFA_deg"),
+            "SLflag": ("SLflag",),
+            "SLFA":   ("SLFA",),
+            "offs":   ("offsets_ppm", "offsets", "ppm", "PulseOffsetPPM"),
+            "npulse": ("n_pulses", "MRF_NumSatPulses", "numSatPulses"),
+        }
+        def _fuzzy(role):
+            """Fallback when no exact name matches: pick the definition by what
+            its name CONTAINS (case-insensitive) — e.g. SatTime_s, B1_uT,
+            PulseOffsetPPM, RepetitionTimes — so other writers' spellings work.
+            Per-measurement lists are preferred over scalars, then shorter
+            (more canonical) names."""
+            def has(s, *subs):
+                return any(x in s for x in subs)
+            cands = []
+            for k, v in seq_defs.items():
+                if not isinstance(v, (int, float, list)):
+                    continue
+                s = k.lower()
+                if role == "B1" and has(s, "b1") and not has(s, "offset", "ppm", "freq"):
+                    cands.append(k)
+                elif role == "offs" and has(s, "offset", "ppm") and not has(s, "m0"):
+                    cands.append(k)
+                elif (role == "Tsat_s" and has(s, "sat")
+                      and has(s, "tsat", "time", "dur", "_s")
+                      and not has(s, "num", "n_pulse", "npulse", "pulses",
+                                  "b1", "ppm", "offset", "fa")):
+                    cands.append(k)
+                elif (role == "TR_s" and (has(s, "actualtr", "repetitiontime", "requestedtr")
+                                          or s in ("tr", "tr_s", "tr_ms"))
+                      and not has(s, "trec", "raster", "gre_")):
+                    cands.append(k)
+                elif (role == "FA" and has(s, "fa", "flip") and has(s, "deg", "exc", "sched", "flip")
+                      and not has(s, "gre_", "slfa", "sl_")):
+                    cands.append(k)
+                elif role == "npulse" and has(s, "pulse") and has(s, "num", "n_"):
+                    cands.append(k)
+                elif role == "tp" and has(s, "pulsedur", "pulse_dur"):
+                    cands.append(k)
+            cands.sort(key=lambda k: (0 if isinstance(seq_defs[k], list) else 1, len(k)))
+            return cands[0] if cands else None
+
+        used = {}
+        per = {}
+        for role, names in _ALIASES.items():
+            key = next((k for k in names if k in seq_defs), None)
+            if key is None:
+                key = _fuzzy(role)
+            per[role] = _lst(seq_defs[key]) if key is not None else []
+            if key is not None:
+                used[role] = key
+        _SEQ_DEFS_LAST_USED.clear()
+        _SEQ_DEFS_LAST_USED.update(used)    # read by _load_seq_file for the label
+
         n = int(_f(seq_defs.get("num_meas", 0), 0))
         if n <= 0:
             n = max((len(v) for v in per.values()), default=0)
         if n <= 0:
             raise ValueError("num_meas missing and no per-measurement arrays found")
 
-        def _get(key, i, default=0.0):
-            arr = per[key]
+        def _get(role, i, default=0.0):
+            arr = per[role]
             if not arr:
                 return default
             return _f(arr[i] if i < len(arr) else arr[-1], default)
 
-        n_pulses = max(1, int(_f(seq_defs.get("n_pulses", 1), 1)))
-        td_s     = _f(seq_defs.get("td", 1e-5), 1e-5)
+        td_s = _f(seq_defs.get("td", 1e-5), 1e-5)
         pw_90, t_img, t_adc = 0.1e-3, 2.1e-3, 1e-3        # == get_seq_defs()
 
         rows = []
         for i in range(n):
+            n_pulses = max(1, int(_get("npulse", i, 1)))
             tp    = _get("tp", i)
-            trec  = _get("Trec", i)
             is_sl = int(bool(_get("SLflag", i)))
-            tsat  = n_pulses * tp + max(n_pulses - 1, 0) * td_s
+            # Total saturation time: explicit (MRF_Tsat_s) wins, else the
+            # pulse train n_pulses·tp + (n_pulses−1)·td  (== tp when CW).
+            if per["Tsat_s"]:
+                tsat = _get("Tsat_s", i)
+                if tsat > 100.0:              # given in ms rather than s
+                    tsat /= 1000.0
+            else:
+                tsat = n_pulses * tp + max(n_pulses - 1, 0) * td_s
+            tsat_col = tsat                   # the table column (lock/sat time)
             if is_sl:
-                tsat += 2.0 * pw_90
-            tr_ms = (trec + tsat + t_img + t_adc) * 1000.0
-            fa    = _get("excFA", i, 60.0)
-            rows.append([round(tr_ms, 1), round(_get("B1pa", i), 4),
-                         round(_get("offsets_ppm", i), 4), round(fa, 1),
-                         round(tp * 1000.0, 1), is_sl,
+                tsat += 2.0 * pw_90           # writer adds this itself — TR only
+            # TR: an explicit full TR (MRF_ActualTR_s) wins, else the exact
+            # inverse of get_seq_defs(): TR = Trec + tsat + t_img + t_adc.
+            if per["TR_s"]:
+                _trv = _get("TR_s", i)
+                tr_ms = _trv if _trv > 100.0 else _trv * 1000.0   # ms if already large
+            else:
+                tr_ms = (_get("Trec", i) + tsat + t_img + t_adc) * 1000.0
+            fa = _get("FA", i, 60.0)
+            rows.append([round(tr_ms, 1), round(_get("B1", i), 4),
+                         round(_get("offs", i), 4), round(fa, 1),
+                         round(tsat_col * 1000.0, 1), is_sl,
                          round(_get("SLFA", i, fa), 1)])
         return rows
 
@@ -1402,10 +1488,22 @@ class SequenceTab(QWidget):
         b0 = seq_defs.get("B0", None)
         extra = (f"  ·  B0 = {b0:g} T"
                  if isinstance(b0, float) and np.isfinite(b0) else "")
+        used = dict(_SEQ_DEFS_LAST_USED)
+        # Which definition names fed the columns — different writers use
+        # different names, and a missing B1 silently yields zeros otherwise.
+        src = ", ".join(f"{role}←{key}" for role, key in used.items()
+                        if role in ("B1", "TR_s", "Trec", "Tsat_s", "tp", "FA", "offs"))
+        warn = ""
+        if "B1" not in used:
+            warn = "   ⚠ no B1 definition found (B1pa / MRF_B1_uT / B1) — amplitudes set to 0"
+        if "offs" not in used:
+            warn += "   ⚠ no offsets definition found — offsets set to 0"
         self.lbl_loaded.setText(
-            f"Loaded .seq: {fn}  ({len(rows)} measurements{extra})")
+            f"Loaded .seq: {fn}  ({len(rows)} measurements{extra})\n"
+            f"columns from: {src}{warn}")
         self.lbl_loaded.setStyleSheet(
-            "font-size: 11px; color: #7ec97e; padding: 2px 0px;")
+            f"font-size: 11px; color: {'#e0a800' if warn else '#7ec97e'}; "
+            "padding: 2px 0px;")
         self.lbl_plot_title.setText(Path(fn).stem.replace("_", " "))
         self._refresh_plot()
 

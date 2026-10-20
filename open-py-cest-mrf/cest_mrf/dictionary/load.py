@@ -104,8 +104,15 @@ def read_mrf_simulation_params(yaml_fn):
         if params['isochromats'] < 30 and params['isochromats'] > 0:
             print('Although the number of isochromats depends on various parameters, we recommend to use at least 30.')
 
-        conf_t2star = input('Specifying T2 parameters will discard the b0_inhom parameter, since T2 calculation uses Cauchy–Lorentz distributed b0_inhom values. Please confirm (write "yes" or "no"):')
-        assert conf_t2star.lower() in ['yes', 'y'], 'You chose to stop the simulation.'
+        import sys as _sys
+        if _sys.stdin is not None and _sys.stdin.isatty():
+            conf_t2star = input('Specifying T2 parameters will discard the b0_inhom parameter, since T2 calculation uses Cauchy–Lorentz distributed b0_inhom values. Please confirm (write "yes" or "no"):')
+            assert conf_t2star.lower() in ['yes', 'y'], 'You chose to stop the simulation.'
+        else:
+            # No terminal (GUI / batch run): an input() prompt would hang or raise
+            # EOFError.  Proceed and state the consequence instead.
+            print('Note: T2* parameters given — the b0_inhom parameter is discarded '
+                  '(Cauchy–Lorentz distributed b0_inhom values are used instead).')
 
     # more optional parameters
     if 'verbose' in params:

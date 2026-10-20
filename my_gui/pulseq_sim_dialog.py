@@ -1028,7 +1028,11 @@ class PulseqSimDialog(QDialog):
         self.btn_sim.setEnabled(True); self._on_seq_changed()
         try:
             import scipy.io as sio
-            d = sio.loadmat(dict_fn)
+            try:                          # dictionaries > 4 GB are MATLAB v7.3 (HDF5)
+                from cest_mrf.matio import loadmat_any as _loadmat
+            except Exception:
+                _loadmat = sio.loadmat
+            d = _loadmat(dict_fn)
             sig = np.asarray(d["sig"], dtype=float)          # (N, n_meas)
             if sig.ndim != 2 or sig.shape[0] < 2:
                 raise ValueError("dictionary has too few entries to plot")

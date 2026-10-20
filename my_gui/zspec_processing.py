@@ -2067,9 +2067,10 @@ def bm3d_denoise(img: np.ndarray, strength: float = 1.0) -> np.ndarray:
     """
     try:
         import bm3d as _bm3dlib
-    except ImportError as _e:
+    except Exception as _e:        # ImportError, or OSError if bm4d's C lib won't load
         raise ImportError(
-            "BM3D denoising requires the 'bm3d' package.  Run:  pip install bm3d"
+            "BM3D denoising requires the 'bm3d' package (and its bm4d C library).  "
+            "Run:  pip install bm3d"
         ) from _e
     x = np.asarray(img, dtype=np.float64)
     single = (x.ndim == 2)

@@ -35,7 +35,8 @@ def dot_prod_indexes(synt_sig:List, acquired_data:List, batch_size:int = 256, re
     norm_dict = synt_sig / (la.norm(synt_sig, axis=0) + 1e-5)
     norm_data = data / (la.norm(data, axis=0) + 1e-5)
 
-    assert norm_data.shape[1] % batch_size == 0, "The number of image pixels must be divisible by batch_size"
+    # The pixel count need not be a multiple of batch_size: the slices below
+    # clip the final, shorter batch.
 
     for batch_start in range(0, norm_data.shape[1], batch_size):
         batch_end = batch_start + batch_size
@@ -76,7 +77,8 @@ def dot_prod_matching(dictionary = None, acquired_data = None, dict_fn = None, a
         raise Exception("Either acquired_data or acquired_data_fn must be specified")
     
     if dict_fn is not None:
-        synt_dict = sio.loadmat(dict_fn)
+        from ..matio import loadmat_any          # classic .mat or v7.3 (HDF5)
+        synt_dict = loadmat_any(dict_fn)
     elif dictionary is not None:
         synt_dict = dictionary
     elif dict_fn is None and dictionary is None:
@@ -144,9 +146,9 @@ def dot_prod_matching(dictionary = None, acquired_data = None, dict_fn = None, a
     norm_dict = synt_sig / (la.norm(synt_sig, axis=0) + 1e-10)
     norm_data = data / (la.norm(data, axis=0) + 1e-10)
 
-    # Matching in batches due to memory considerations
-    # The number of image pixel needs to be dividable by batch_size
-    assert np.shape(data)[1] / batch_size == np.round(np.shape(data)[1] / batch_size)
+    # Matching in batches due to memory considerations.  The pixel count need
+    # NOT be a multiple of batch_size: the slices below clip the final, shorter
+    # batch (the old assertion here crashed on e.g. 116x116 = 13456 pixels).
 
     batch_indices = range(0, data.shape[1], batch_size)
     for ind in range(np.size(batch_indices)):

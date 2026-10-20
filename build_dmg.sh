@@ -28,7 +28,7 @@ ICNS_PATH="assets/AppIcon.icns"
 
 if [ -f "${ICON_SRC}" ]; then
     echo ""
-    echo "▶ Converting icon.png → ${ICNS_PATH}…"
+    echo "Converting icon.png → ${ICNS_PATH}…"
     mkdir -p "${ICONSET_DIR}"
     for size in 16 32 64 128 256 512; do
         sips -z "${size}" "${size}" "${ICON_SRC}" \
@@ -43,7 +43,7 @@ else
 fi
 
 echo ""
-echo "▶ Cleaning previous build artefacts…"
+echo "Cleaning previous build artefacts…"
 rm -rf build/ \
        "${DIST_DIR}/OCEAN" \
        "${DIST_DIR}/${APP_NAME}.app" \
@@ -52,7 +52,7 @@ rm -rf build/ \
        __pycache__
 
 echo ""
-echo "▶ Running PyInstaller (this takes 1–3 minutes)…"
+echo "Running PyInstaller (this takes 1–3 minutes)…"
 pyinstaller "${SPEC_FILE}" \
     --clean \
     --noconfirm \
@@ -66,12 +66,12 @@ fi
 echo "   ✓ App bundle: ${APP_BUNDLE}"
 
 echo ""
-echo "▶ Verifying bundle structure…"
+echo "Verifying bundle structure…"
 ls "${APP_BUNDLE}/Contents/MacOS/" | head -5
 echo "   ✓ Bundle structure looks good."
 
 echo ""
-echo "▶ Creating DMG…"
+echo "Creating DMG…"
 
 BUNDLED_ICNS="${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 if [ ! -f "${BUNDLED_ICNS}" ]; then

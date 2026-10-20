@@ -522,6 +522,12 @@ class ZSpecTab(QWidget):
             ["Bruker", "GE/Siemens", "MR Solutions", "MATLAB (.mat)",
              "Siemens TWIX (.dat)"]
         )
+        from PyQt6.QtCore import Qt as _Qt
+        self.combo_vendor_cest.setItemData(
+            3,
+            "MATLAB .mat (any variable names): Z-stack (Y,X,N) or (Y,X,slices,N)\n"
+            "+ a vector of N saturation offsets in ppm (or pick an offsets .txt)",
+            _Qt.ItemDataRole.ToolTipRole)
         vendor_cest_row.addWidget(self.combo_vendor_cest, stretch=1)
         g1.addLayout(vendor_cest_row)
 
@@ -757,6 +763,12 @@ class ZSpecTab(QWidget):
             ["Bruker", "GE/Siemens", "MR Solutions", "MATLAB (.mat)",
              "Siemens TWIX (.dat)"]
         )
+        from PyQt6.QtCore import Qt as _QtW
+        self.combo_vendor_wassr.setItemData(
+            3,
+            "MATLAB .mat (any variable names): WASSR stack (Y,X,N) or (Y,X,slices,N)\n"
+            "+ a vector of N offsets in ppm (or pick an offsets .txt)",
+            _QtW.ItemDataRole.ToolTipRole)
         vendor_wassr_row.addWidget(self.combo_vendor_wassr, stretch=1)
         g2.addLayout(vendor_wassr_row)
 
@@ -2195,6 +2207,12 @@ class ZSpecTab(QWidget):
             self._log(f"  TWIX recon: {info['matrix'][0]}×{info['matrix'][1]} px, "
                       f"{n_off} offsets, {info['n_coils']} coils, "
                       f"M0 = frame {info['m0_frame_idx']}")
+            _vx = info.get("voxel_mm") or (None, None, None)
+            if _vx[0] and _vx[1]:
+                self._log(f"  voxel size: {_vx[0]:.2f} × {_vx[1]:.2f} × "
+                          f"{_vx[2] if _vx[2] is not None else '?'} mm "
+                          f"(FOV {info['fov_mm'][0]:g} × {info['fov_mm'][1]:g} mm "
+                          f"/ reconstructed matrix)")
             _finish_cest_load(self, stack, ppm_all, source="Siemens TWIX (.dat)",
                               m0_override=M0)
         except Exception as exc:

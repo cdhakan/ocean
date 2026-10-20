@@ -9,6 +9,7 @@ from ..simulation.simulate import simulate_mrf
 
 import math
 from scipy.io import savemat
+from ..matio import savemat_any       # v5, or v7.3 (HDF5) when a variable > 4 GB
 import numpy as np
 #import hdf5storage
 import tqdm
@@ -102,7 +103,7 @@ def prepare_dictionary(dict_, equals=None):
 def save_dict_mat(dict_fn, dictionary):
     mat_dict = {k: np.array(v) if isinstance(v, list) else v
                 for k, v in dictionary.items()}
-    sio.savemat(dict_fn, mat_dict)
+    savemat_any(dict_fn, mat_dict)
     print(f"Dictionary saved to {dict_fn} .")
 
 
@@ -205,6 +206,15 @@ def generate_mrf_cest_dictionary(seq_fn=None,
     dictionary = new_dict
     dictionary['sig'] = combined_signals
     
-    savemat(dict_fn, dictionary)
+    # `sig` as one float array (not a list of rows): makes the size check cheap
+    # and stops savemat from building the array a second time.  Dictionaries
+    # whose `sig` exceeds the 4 GB limit of the classic .mat format are written
+    # as MATLAB v7.3 (HDF5) instead of failing with "Matrix too large to save
+    # with Matlab 5 format".
+    dictionary['sig'] = np.asarray(dictionary['sig'])
+    fmt = savemat_any(dict_fn, dictionary)
+    if fmt == "v7.3":
+        print(f"Dictionary exceeds the 4 GB classic .mat limit — saved as "
+              f"MATLAB v7.3 (HDF5): {dict_fn}")
 
     return dictionary

@@ -224,6 +224,19 @@ def read_twix_cest(path: str, slice_idx: int = 0,
         except Exception:
             return None
 
+    # Voxel size = header FOV / RECONSTRUCTED matrix.  The header FOV and slice
+    # thickness are reliable even for Pulseq-interpreter scans; the header
+    # matrix fields are not (dummy GUI values), hence the reconstructed shape.
+    def _slice0(key):
+        try:
+            return float(hdr["MeasYaps"]["sSliceArray"]["asSlice"][0][key])
+        except Exception:
+            return None
+    _fov = (_slice0("dReadoutFOV"), _slice0("dPhaseFOV"), _slice0("dThickness"))
+    _vox = ((_fov[0] / stack.shape[0]) if _fov[0] else None,
+            (_fov[1] / stack.shape[1]) if _fov[1] else None,
+            _fov[2])
+
     info = {
         "n_offsets":       noff,
         "matrix":          (stack.shape[0], stack.shape[1]),
@@ -236,6 +249,8 @@ def read_twix_cest(path: str, slice_idx: int = 0,
         "pe_order":        order,
         "larmor_mhz":      _hdr(("Dicom", "lFrequency"), 1e-6),
         "b0_t":            _hdr(("Dicom", "flMagneticFieldStrength")),
+        "fov_mm":          _fov,       # (readout, phase, slice thickness)
+        "voxel_mm":        _vox,       # (Y, X, slice) — None when unknown
         "source":          "Siemens TWIX (.dat)",
         "notes":           notes,
     }

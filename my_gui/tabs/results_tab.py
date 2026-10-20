@@ -2284,7 +2284,11 @@ class ResultsTab(QWidget):
             if str(self._dict_fn).endswith(".npz"):
                 synt_dict = dict(np.load(self._dict_fn, allow_pickle=True))
             else:
-                synt_dict = sio.loadmat(self._dict_fn)
+                try:                      # dictionaries > 4 GB are MATLAB v7.3 (HDF5)
+                    from cest_mrf.matio import loadmat_any as _loadmat
+                except Exception:
+                    _loadmat = sio.loadmat
+                synt_dict = _loadmat(self._dict_fn)
         except Exception as exc:
             QMessageBox.critical(self, "Error loading dictionary", str(exc))
             return
